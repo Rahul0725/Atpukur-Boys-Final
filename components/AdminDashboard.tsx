@@ -106,8 +106,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose }) => {
   const onlineCount = users.filter(u => u.is_online).length;
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-2 md:p-4">
-      <GlassCard className="w-full max-w-6xl h-[95vh] md:h-[90vh] flex flex-col animate-in fade-in zoom-in duration-300 border-neon-green/20">
+    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-0 md:p-4">
+      <GlassCard className="w-full max-w-6xl h-[100dvh] md:h-[90vh] rounded-none md:rounded-xl flex flex-col animate-in fade-in zoom-in duration-300 border-neon-green/20">
         
         {/* Header */}
         <div className="p-4 md:p-6 border-b border-white/10 flex justify-between items-center bg-black/20 shrink-0">

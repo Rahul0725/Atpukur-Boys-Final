@@ -289,7 +289,7 @@ export default function App() {
 
   if (!currentUser) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-4 relative overflow-hidden bg-black">
+      <div className="h-[100dvh] flex items-center justify-center p-4 relative overflow-hidden bg-black">
         {/* Cyberpunk Login Background */}
         <div className="absolute inset-0 pointer-events-none">
            <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-neon-green/10 rounded-full blur-[100px] animate-pulse-slow"></div>
@@ -332,7 +332,7 @@ export default function App() {
   }
 
   return (
-    <div className="h-screen flex flex-col md:flex-row bg-black relative overflow-hidden">
+    <div className="h-[100dvh] flex flex-col md:flex-row bg-black relative overflow-hidden">
       {/* App Background */}
       <div className="absolute inset-0 pointer-events-none z-0">
           <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-neon-blue/5 rounded-full blur-[120px]"></div>

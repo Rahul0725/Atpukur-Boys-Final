@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>ATPUKUR BOYS // Secure Chat</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
@@ -45,10 +45,12 @@
           radial-gradient(circle at 0% 100%, #0f1c15 0%, transparent 30%);
         color: #e5e5e5;
         overflow: hidden; /* App handles scrolling */
+        height: 100dvh; /* Mobile viewport fix */
       }
       /* Custom Scrollbar */
       ::-webkit-scrollbar {
         width: 6px;
+        height: 6px;
       }
       ::-webkit-scrollbar-track {
         background: rgba(0,0,0,0.3);
@@ -59,6 +61,16 @@
       }
       ::-webkit-scrollbar-thumb:hover {
         background: rgba(0, 255, 65, 0.3);
+      }
+      
+      /* Hide scrollbar for Chrome, Safari and Opera */
+      .no-scrollbar::-webkit-scrollbar {
+        display: none;
+      }
+      /* Hide scrollbar for IE, Edge and Firefox */
+      .no-scrollbar {
+        -ms-overflow-style: none;  /* IE and Edge */
+        scrollbar-width: none;  /* Firefox */
       }
     </style>
   <script type="importmap">
