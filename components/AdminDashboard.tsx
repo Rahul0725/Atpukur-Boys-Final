@@ -60,17 +60,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose }) => {
     if (confirm(`CRITICAL: TERMINATE OPERATIVE "${username}"? This will expunge their identity and ALL associated communications.`)) {
         setLoading(true);
         
-        // We rely on SQL "ON DELETE CASCADE" to handle message cleanup atomically.
-        // This prevents race conditions and partial deletions.
+        // 1. Manually delete all messages associated with the user first
+        // This ensures deletion works even if "ON DELETE CASCADE" is not configured in SQL
+        await supabase.from('messages').delete().eq('sender_id', userId);
+        await supabase.from('messages').delete().eq('receiver_id', userId);
+
+        // 2. Delete the user record
         const { error } = await supabase.from('users').delete().eq('id', userId);
         
         if (error) {
             console.error(error);
-            if (error.code === '23503') {
-                alert('TERMINATION FAILED: Database constraint violation.\n\nPlease run the "ON DELETE CASCADE" SQL script in Supabase to enable automatic message cleanup.');
-            } else {
-                alert('TERMINATION FAILED: ' + error.message);
-            }
+            alert('TERMINATION FAILED: ' + error.message);
         } else {
             // Refresh data
             await fetchData();

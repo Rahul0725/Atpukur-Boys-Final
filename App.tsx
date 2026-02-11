@@ -3,7 +3,7 @@ import { supabase, checkSupabaseConfig } from './supabaseClient';
 import { User, Message } from './types';
 import { GlassCard, NeonButton, Input, Badge } from './components/Layout';
 import { AdminDashboard } from './components/AdminDashboard';
-import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Monitor, MonitorOff, Terminal, Cpu } from 'lucide-react';
+import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Terminal, Cpu } from 'lucide-react';
 
 // Constant for the Group Chat "User" placeholder
 const GROUP_CHAT_ID = 'global_public_channel';
@@ -133,10 +133,13 @@ export default function App() {
     // 1. Database Persistence (for Last Seen & History)
     // We still update the DB, but less frequently, just to keep "last_seen" roughly accurate.
     const updateDbPresence = async (status: boolean) => {
+      // Guard against null currentUser inside async closure
+      if (!currentUserRef.current) return;
+      
       await supabase.from('users').update({ 
         is_online: status,
         last_seen: new Date().toISOString()
-      }).eq('id', currentUser.id);
+      }).eq('id', currentUserRef.current.id);
     };
 
     updateDbPresence(true);
@@ -252,7 +255,8 @@ export default function App() {
 
     const signalingSub = supabase.channel('public:signaling')
       .on('broadcast', { event: 'signal' }, async ({ payload }) => {
-        if (!payload || payload.targetId !== currentUser.id) return;
+        // Guard against race conditions where currentUser might be null in closure
+        if (!payload || !currentUser || payload.targetId !== currentUser.id) return;
         
         const currentStatus = callStatusRef.current;
         // Check if this is a renegotiation (we are connected and have a PC)
@@ -514,61 +518,6 @@ export default function App() {
     }
   };
 
-  const startScreenShare = async () => {
-     if (!peerConnectionRef.current) return;
-     const pc = peerConnectionRef.current;
-
-     try {
-        console.log("Requesting display media...");
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-        const screenTrack = screenStream.getVideoTracks()[0];
-        
-        screenTrack.onended = () => {
-             stopScreenShare();
-        };
-
-        if (localStreamRef.current) {
-            localStreamRef.current.addTrack(screenTrack);
-            pc.addTrack(screenTrack, localStreamRef.current);
-        } else {
-            pc.addTrack(screenTrack, screenStream);
-        }
-
-        setIsScreenSharing(true);
-        console.log("Screen track added, creating offer...");
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        
-        const targetId = activeUser?.id || incomingCallUser?.id;
-        
-        if (targetId) {
-            await supabase?.channel('public:signaling').send({
-                type: 'broadcast',
-                event: 'signal',
-                payload: {
-                    type: 'offer',
-                    targetId: targetId,
-                    caller: currentUser,
-                    sdp: offer
-                }
-            });
-            console.log("Screen share offer sent.");
-        }
-     } catch (e) {
-        console.error("Failed to share screen", e);
-        setIsScreenSharing(false);
-     }
-  };
-
-  const toggleScreenShare = () => {
-     if (isScreenSharing) {
-        stopScreenShare();
-     } else {
-        startScreenShare();
-     }
-  };
-
   const endCall = () => {
     const targetId = activeUser?.id || incomingCallUser?.id;
     if (targetId) {
@@ -701,6 +650,7 @@ export default function App() {
     localStorage.removeItem('atpukur_user_id');
     setCurrentUser(null);
     setActiveUser(null);
+    setUsers([]); // Clear users to prevent stale data crash
     setMessages([]);
     setUnreadCounts({});
     setLoginError(null);
@@ -735,40 +685,16 @@ export default function App() {
     return emojis[Math.abs(hash) % emojis.length];
   };
 
-  // Helper Component for Call Buttons
-  const CallControlButton = ({ active, onClick, icon: Icon, label, variant = 'normal' }: any) => (
-    <button 
-      onClick={onClick}
-      className="flex flex-col items-center gap-2 group"
-    >
-      <div className={`
-        w-14 h-14 rounded-full border flex items-center justify-center transition-all duration-300
-        ${variant === 'danger' 
-          ? 'bg-red-500/20 border-red-500 text-red-500 hover:bg-red-500 hover:text-white shadow-[0_0_15px_rgba(239,68,68,0.3)]' 
-          : variant === 'accept'
-             ? 'bg-neon-green/10 border-neon-green text-neon-green hover:bg-neon-green hover:text-black shadow-[0_0_15px_rgba(0,255,65,0.3)] animate-pulse'
-          : active 
-            ? 'bg-white text-black border-white shadow-[0_0_15px_rgba(255,255,255,0.3)]' 
-            : 'bg-black/40 text-gray-300 border-white/20 hover:border-white hover:text-white hover:bg-white/10'
-        }
-      `}>
-        <Icon className="w-6 h-6" />
-      </div>
-      <span className="text-[10px] font-mono uppercase tracking-widest opacity-70 group-hover:opacity-100 transition-opacity text-gray-400">
-        {label}
-      </span>
-    </button>
-  );
-
   // --- Helpers for Display ---
   // Sort users so connected (green dot) users are always first
-  const sortedUsers = [...users.filter(u => u.id !== currentUser.id)].sort((a, b) => {
+  // SAFEGUARD: Check currentUser exists before filtering
+  const sortedUsers = currentUser ? [...users.filter(u => u.id !== currentUser.id)].sort((a, b) => {
     const aOnline = onlineUserIds.has(a.id);
     const bOnline = onlineUserIds.has(b.id);
     if (aOnline && !bOnline) return -1;
     if (!aOnline && bOnline) return 1;
     return 0;
-  });
+  }) : [];
 
   const getIsUserOnline = (userId: string) => onlineUserIds.has(userId);
 
@@ -917,132 +843,114 @@ export default function App() {
 
       {/* CALL OVERLAY UI */}
       {callStatus !== 'idle' && (
-        <div className={`fixed inset-0 z-50 flex flex-col items-center justify-center p-4 animate-in fade-in duration-300 ${hasRemoteVideo ? 'bg-black' : 'bg-black/95 backdrop-blur-2xl'}`}>
+        <div className={`fixed inset-0 z-50 flex flex-col items-center justify-between animate-in fade-in duration-300 ${hasRemoteVideo ? 'bg-black' : 'bg-[#0a0a0a]'}`}>
            
-           {/* Background Effects */}
+           {/* Background Layer */}
            {!hasRemoteVideo && (
-             <div className="absolute inset-0 pointer-events-none overflow-hidden">
-                {/* Grid */}
-                <div className="absolute inset-0 bg-[linear-gradient(rgba(0,255,65,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(0,255,65,0.03)_1px,transparent_1px)] bg-[size:40px_40px]"></div>
-                {/* Ambient Glow */}
-                <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full blur-[100px] opacity-20 animate-pulse ${callStatus === 'connected' ? 'bg-neon-green' : callStatus === 'incoming' ? 'bg-neon-purple' : 'bg-neon-blue'}`}></div>
-             </div>
+             <>
+               {/* Blurred Avatar Background */}
+               <div className="absolute inset-0 overflow-hidden z-0 opacity-30">
+                  <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black/80 z-10"></div>
+                  <div className="w-full h-full flex items-center justify-center blur-[100px] scale-150">
+                     <div className="text-[150px]">{getAvatarEmoji((incomingCallUser?.username || activeUser?.username || ""))}</div>
+                  </div>
+               </div>
+               {/* Noise/Cyber Overlay */}
+               <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-[0.05] mix-blend-overlay z-0"></div>
+             </>
            )}
 
-           {/* Remote Video Element */}
+           {/* Remote Video Layer */}
            <video 
               key={hasRemoteVideo ? 'remote-video-active' : 'remote-video-inactive'}
               ref={remoteVideoRef} 
               autoPlay 
               playsInline 
               muted={false}
-              className={`absolute inset-0 w-full h-full object-contain z-0 transition-opacity duration-500 ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`} 
+              className={`absolute inset-0 w-full h-full object-cover z-0 transition-opacity duration-500 ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`} 
            />
 
-           {/* Main Container */}
-           <div className={`relative z-10 flex flex-col items-center w-full transition-all duration-500 ${hasRemoteVideo ? 'mt-auto mb-8 max-w-3xl bg-black/80 p-6 rounded-2xl backdrop-blur-xl border border-white/10 shadow-2xl' : 'max-w-sm'}`}>
-              
-              {/* Header / Status info when video is active */}
-              {hasRemoteVideo && (
-                 <div className="absolute top-0 left-0 right-0 -mt-16 flex justify-between px-6 pointer-events-none">
-                    <div className="bg-black/60 backdrop-blur border border-white/10 rounded-full px-4 py-2 flex items-center gap-2 shadow-lg">
-                       <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
-                       <span className="font-mono text-xs text-white tracking-wider">{formatDuration(callDuration)}</span>
-                    </div>
-                    <div className="bg-black/60 backdrop-blur border border-white/10 rounded-full px-4 py-2 shadow-lg">
-                       <span className="font-mono text-xs text-white tracking-wider">{incomingCallUser?.username || activeUser?.username}</span>
+           {/* Top Header */}
+           <div className="relative z-10 w-full pt-12 pb-4 flex flex-col items-center bg-gradient-to-b from-black/80 to-transparent">
+              <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/10 backdrop-blur-md mb-4 shadow-lg">
+                  <Lock className="w-3 h-3 text-neon-green" />
+                  <span className="text-[10px] font-mono text-neon-green tracking-widest uppercase">End-to-End Encrypted</span>
+              </div>
+              <h2 className="text-3xl font-mono font-bold text-white tracking-tight drop-shadow-md">
+                {incomingCallUser?.username || activeUser?.username}
+              </h2>
+              <p className="text-sm font-mono text-gray-300 tracking-widest mt-2">
+                 {callStatus === 'connected' ? formatDuration(callDuration) : callStatus === 'incoming' ? 'INCOMING CALL...' : 'CALLING...'}
+              </p>
+           </div>
+
+           {/* Center Content (Avatar) - Only visible if no video */}
+           {!hasRemoteVideo && (
+              <div className="relative z-10 flex-1 flex items-center justify-center w-full">
+                 <div className="relative group">
+                    {/* Ripples */}
+                    <div className={`absolute inset-0 rounded-full animate-ping opacity-20 ${callStatus === 'incoming' ? 'bg-neon-purple' : 'bg-neon-green'}`}></div>
+                    <div className={`absolute inset-0 rounded-full animate-pulse opacity-20 blur-xl ${callStatus === 'incoming' ? 'bg-neon-purple' : 'bg-neon-green'}`}></div>
+                    
+                    <div className="w-40 h-40 rounded-full bg-[#151515] border border-white/10 flex items-center justify-center text-7xl shadow-2xl relative z-10">
+                       {getAvatarEmoji((incomingCallUser?.username || activeUser?.username || ""))}
                     </div>
                  </div>
-              )}
-
-              {/* Avatar & Info (Hidden if Video Active) */}
-              {!hasRemoteVideo && (
-                <div className="flex flex-col items-center mb-12 w-full">
-                   {/* Incoming Call Header */}
-                   {callStatus === 'incoming' && (
-                     <div className="w-full bg-neon-purple/10 border-y border-neon-purple/30 py-2 mb-8 text-center animate-pulse">
-                       <p className="font-mono text-neon-purple tracking-[0.3em] text-xs font-bold uppercase">Incoming Encrypted Signal</p>
-                     </div>
-                   )}
-
-                   {/* Avatar Hexagon/Circle */}
-                   <div className="mb-8 relative group">
-                      <div className="w-40 h-40 rounded-full bg-black border border-white/10 flex items-center justify-center relative overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] z-10 text-6xl">
-                         {getAvatarEmoji((incomingCallUser?.username || activeUser?.username || ""))}
-                      </div>
-                      
-                      {/* Orbital Rings */}
-                      <div className={`absolute inset-0 -m-4 border border-dashed rounded-full animate-[spin_10s_linear_infinite] opacity-30 ${callStatus === 'incoming' ? 'border-neon-purple' : 'border-neon-green'}`}></div>
-                      <div className={`absolute inset-0 -m-8 border border-dotted rounded-full animate-[spin_15s_linear_infinite_reverse] opacity-20 ${callStatus === 'incoming' ? 'border-neon-purple' : 'border-neon-blue'}`}></div>
-                      
-                      {/* Status Pulse */}
-                      <div className={`absolute -bottom-4 left-1/2 -translate-x-1/2 px-3 py-1 bg-black border rounded text-[10px] font-mono tracking-widest uppercase z-20 whitespace-nowrap ${
-                        callStatus === 'connected' ? 'border-neon-green text-neon-green shadow-[0_0_10px_rgba(0,255,65,0.2)]' :
-                        callStatus === 'incoming' ? 'border-neon-purple text-neon-purple shadow-[0_0_10px_rgba(188,19,254,0.2)] animate-pulse' :
-                        'border-neon-blue text-neon-blue'
-                      }`}>
-                        {callStatus === 'connected' ? formatDuration(callDuration) : callStatus === 'incoming' ? 'CONNECTING...' : 'DIALING...'}
-                      </div>
-                   </div>
-
-                   <h2 className="text-3xl font-mono text-white font-bold mb-2 tracking-tight text-center">
-                     {incomingCallUser?.username || activeUser?.username}
-                   </h2>
-                   <p className="text-xs font-mono text-gray-500 tracking-[0.2em] uppercase">
-                     {callStatus === 'connected' ? 'Secure Voice Channel' : 'Establishing Handshake'}
-                   </p>
-                </div>
-              )}
-
-              {/* Action Buttons */}
-              <div className="flex items-end justify-center gap-6 md:gap-8">
-                 
-                 {/* Incoming Call Actions */}
-                 {callStatus === 'incoming' ? (
-                   <>
-                      <CallControlButton 
-                        icon={PhoneOff} 
-                        variant="danger" 
-                        onClick={cleanupCall} 
-                        label="DECLINE"
-                      />
-                      <div className="w-px h-12 bg-white/10 mx-2"></div>
-                      <CallControlButton 
-                        icon={Phone} 
-                        variant="accept"
-                        onClick={answerCall} 
-                        label="ACCEPT"
-                      />
-                   </>
-                 ) : (
-                   /* Active Call Actions */
-                   <>
-                     <CallControlButton 
-                       icon={isMuted ? MicOff : Mic} 
-                       active={!isMuted} // If not muted, it's "active" (white). If muted, dark.
-                       onClick={toggleMute} 
-                       label={isMuted ? "UNMUTE" : "MUTE"}
-                     />
-                     
-                     <CallControlButton 
-                       icon={isScreenSharing ? MonitorOff : Monitor} 
-                       active={isScreenSharing} 
-                       onClick={toggleScreenShare} 
-                       label={isScreenSharing ? "STOP" : "SHARE"}
-                     />
-
-                     <div className="w-px h-12 bg-white/10 mx-2"></div>
-
-                     <CallControlButton 
-                       icon={PhoneOff} 
-                       variant="danger" 
-                       onClick={endCall} 
-                       label="END"
-                     />
-                   </>
-                 )}
               </div>
+           )}
 
+           {/* Bottom Controls Panel */}
+           <div className={`relative z-10 w-full pb-10 pt-8 px-8 flex flex-col items-center justify-end bg-gradient-to-t from-black via-black/80 to-transparent ${hasRemoteVideo ? 'opacity-0 hover:opacity-100 transition-opacity duration-300' : ''}`}>
+              
+              {callStatus === 'incoming' ? (
+                 /* Incoming Call UI */
+                 <div className="flex w-full justify-between items-center max-w-xs mx-auto mb-4">
+                     <div className="flex flex-col items-center gap-2">
+                         <button 
+                           onClick={cleanupCall} 
+                           className="w-16 h-16 rounded-full bg-red-500 text-white flex items-center justify-center shadow-lg hover:bg-red-600 transition-transform hover:scale-105"
+                         >
+                            <PhoneOff className="w-7 h-7" />
+                         </button>
+                         <span className="text-[10px] font-mono text-gray-400 tracking-widest">DECLINE</span>
+                     </div>
+                     <div className="flex flex-col items-center gap-2">
+                         <button 
+                           onClick={answerCall} 
+                           className="w-16 h-16 rounded-full bg-neon-green text-black flex items-center justify-center shadow-lg hover:bg-[#00cc33] transition-transform hover:scale-105 animate-pulse"
+                         >
+                            <Phone className="w-7 h-7 fill-current" />
+                         </button>
+                         <span className="text-[10px] font-mono text-gray-400 tracking-widest">ACCEPT</span>
+                     </div>
+                 </div>
+              ) : (
+                 /* Active Call UI */
+                 <div className="w-full max-w-sm mx-auto flex flex-col gap-6">
+                     {/* Secondary Controls Row */}
+                     <div className="flex justify-center items-center gap-8">
+                        {/* Mute Button */}
+                        <button 
+                          onClick={toggleMute}
+                          className={`flex flex-col items-center gap-2 group transition-all duration-300 ${isMuted ? 'text-black' : 'text-white'}`}
+                        >
+                           <div className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-300 border ${isMuted ? 'bg-white border-white' : 'bg-white/10 border-white/10 hover:bg-white/20'}`}>
+                              {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                           </div>
+                        </button>
+                     </div>
+
+                     {/* End Call Button */}
+                     <div className="flex justify-center">
+                        <button 
+                           onClick={endCall} 
+                           className="w-20 h-20 rounded-full bg-red-500 text-white flex items-center justify-center shadow-[0_0_30px_rgba(239,68,68,0.4)] transition-transform hover:scale-105 hover:bg-red-600"
+                        >
+                           <PhoneOff className="w-9 h-9 fill-current" />
+                        </button>
+                     </div>
+                 </div>
+              )}
            </div>
         </div>
       )}
