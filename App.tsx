@@ -117,10 +117,11 @@ export default function App() {
   // Attach remote stream to video element whenever hasRemoteVideo changes
   useEffect(() => {
     if (hasRemoteVideo && remoteVideoRef.current && remoteStreamRef.current) {
+        console.log("Attaching video stream to element", remoteStreamRef.current.getTracks());
         remoteVideoRef.current.srcObject = remoteStreamRef.current;
         remoteVideoRef.current.play().catch(e => console.error("Error playing video:", e));
     }
-  }, [hasRemoteVideo]);
+  }, [hasRemoteVideo, remoteStreamRef.current]); // Added remoteStreamRef.current dependency
 
   // --- Presence & User List Logic ---
   useEffect(() => {
@@ -224,11 +225,13 @@ export default function App() {
           }
 
           if (isRenegotiation) {
+             console.log("Received Renegotiation Offer");
              const pc = peerConnectionRef.current;
              if (!pc) return;
 
              // Handle glare or state mismatch
              if (pc.signalingState !== "stable") {
+                 console.log("Rollback signaling state");
                  await Promise.all([
                      pc.setLocalDescription({type: "rollback"}),
                      pc.setRemoteDescription(new RTCSessionDescription(payload.sdp))
@@ -266,6 +269,7 @@ export default function App() {
         if (payload.type === 'answer') {
            const pc = peerConnectionRef.current;
            if (pc) {
+             console.log("Received Answer");
              // We can accept answer even if not "stable" if we are the offerer
              await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
              
@@ -319,22 +323,34 @@ export default function App() {
     };
 
     pc.ontrack = (event) => {
-      console.log("Track received:", event.track.kind);
-      // If we receive a track, we use the stream provided by the event
-      const stream = event.streams[0] || new MediaStream([event.track]);
+      console.log("Track received:", event.track.kind, event.streams);
       
-      // Always update remote stream ref
+      // If we receive a track, use the stream provided by the event or create one
+      // Important: Use existing ref if the stream ID matches to avoid thrashing
+      let stream = event.streams[0];
+      if (!stream) {
+          stream = new MediaStream();
+          stream.addTrack(event.track);
+      }
+      
       remoteStreamRef.current = stream;
 
       if (event.track.kind === 'video') {
-         console.log("Video track detected");
+         console.log("Video track detected via ontrack");
          setHasRemoteVideo(true);
          
+         // Force re-attach for video element
+         if (remoteVideoRef.current) {
+             remoteVideoRef.current.srcObject = stream;
+             remoteVideoRef.current.play().catch(console.error);
+         }
+
          event.track.onended = () => {
              console.log("Video track ended");
              setHasRemoteVideo(false);
          };
       } else if (event.track.kind === 'audio') {
+          // If we have video, the video element plays the audio too if it's the same stream
           if (remoteAudioRef.current) {
             remoteAudioRef.current.srcObject = stream;
             remoteAudioRef.current.play().catch(e => console.error("Error playing audio:", e));
@@ -421,13 +437,18 @@ export default function App() {
   const stopScreenShare = async () => {
     if (!peerConnectionRef.current || !isScreenSharing) return;
     
-    // Stop tracks
-    const senders = peerConnectionRef.current.getSenders();
+    console.log("Stopping screen share");
+    const pc = peerConnectionRef.current;
+    
+    // Find and remove the video sender
+    const senders = pc.getSenders();
     const videoSender = senders.find(s => s.track?.kind === 'video');
+    
     if (videoSender) {
-        peerConnectionRef.current.removeTrack(videoSender);
+        pc.removeTrack(videoSender);
     }
 
+    // Stop the local track
     if (localStreamRef.current) {
         const videoTracks = localStreamRef.current.getVideoTracks();
         videoTracks.forEach(t => {
@@ -440,8 +461,8 @@ export default function App() {
 
     // Negotiate removal
     try {
-      const offer = await peerConnectionRef.current.createOffer();
-      await peerConnectionRef.current.setLocalDescription(offer);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
       
       const targetId = activeUser?.id || incomingCallUser?.id;
       if (targetId) {
@@ -466,6 +487,7 @@ export default function App() {
      const pc = peerConnectionRef.current;
 
      try {
+        console.log("Requesting display media...");
         const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
         const screenTrack = screenStream.getVideoTracks()[0];
         
@@ -473,14 +495,20 @@ export default function App() {
              stopScreenShare();
         };
 
+        // Add to local stream for consistency, though not strictly required for sending
         if (localStreamRef.current) {
             localStreamRef.current.addTrack(screenTrack);
-            // Add track to PC
+            // Add track to PC. Use localStreamRef to ensure stream ID matches if possible
             pc.addTrack(screenTrack, localStreamRef.current);
+        } else {
+            // Fallback if no audio call existed (unlikely in this flow)
+            pc.addTrack(screenTrack, screenStream);
         }
 
         setIsScreenSharing(true);
+        console.log("Screen track added, creating offer...");
 
+        // Create Offer for renegotiation
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         
@@ -497,6 +525,7 @@ export default function App() {
                     sdp: offer
                 }
             });
+            console.log("Screen share offer sent.");
         }
      } catch (e) {
         console.error("Failed to share screen", e);
@@ -850,9 +879,11 @@ export default function App() {
 
            {/* Remote Video Element */}
            <video 
+              key={hasRemoteVideo ? 'remote-video-active' : 'remote-video-inactive'}
               ref={remoteVideoRef} 
               autoPlay 
               playsInline 
+              muted={false}
               className={`absolute inset-0 w-full h-full object-contain z-0 transition-opacity duration-500 ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`} 
            />
 
