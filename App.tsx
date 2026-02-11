@@ -821,6 +821,9 @@ export default function App() {
                  <p className="text-[10px] text-gray-600 font-mono">
                     ENCRYPTION: AES-256-GCM // SERVER: ON-LINE
                  </p>
+                 <a href="https://t.me/Its_Gods" target="_blank" rel="noopener noreferrer" className="block mt-2 text-[10px] text-neon-green/40 hover:text-neon-green font-mono tracking-widest uppercase transition-colors">
+                    SYSTEM ARCHITECT: @Its_Gods
+                 </a>
               </div>
            </div>
         </div>
@@ -1066,7 +1069,7 @@ export default function App() {
         </div>
 
         {/* Footer */}
-        <div className="p-4 border-t border-white/10 bg-black/20">
+        <div className="p-4 border-t border-white/10 bg-black/20 flex flex-col gap-2">
            {currentUser.role === 'admin' ? (
              <NeonButton 
                variant="primary" 
@@ -1084,6 +1087,9 @@ export default function App() {
                </span>
              </div>
            )}
+           <a href="https://t.me/Its_Gods" target="_blank" rel="noopener noreferrer" className="text-[9px] text-center text-gray-600 hover:text-neon-blue font-mono tracking-widest uppercase transition-colors mt-1 opacity-50 hover:opacity-100">
+              DEV_NODE: @Its_Gods
+           </a>
         </div>
       </div>
 
