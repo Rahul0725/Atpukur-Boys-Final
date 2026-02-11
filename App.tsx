@@ -3,7 +3,7 @@ import { supabase, checkSupabaseConfig } from './supabaseClient';
 import { User, Message } from './types';
 import { GlassCard, NeonButton, Input, Badge } from './components/Layout';
 import { AdminDashboard } from './components/AdminDashboard';
-import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Monitor, MonitorOff } from 'lucide-react';
+import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Monitor, MonitorOff, Terminal, Cpu } from 'lucide-react';
 
 // Constant for the Group Chat "User" placeholder
 const GROUP_CHAT_ID = 'global_public_channel';
@@ -51,6 +51,7 @@ export default function App() {
   const [loginUsername, setLoginUsername] = useState('');
   const [isConfigured, setIsConfigured] = useState(true);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [isRestoringSession, setIsRestoringSession] = useState(true);
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -66,9 +67,30 @@ export default function App() {
   const callTimerRef = useRef<any>(null);
   const callStatusRef = useRef<CallStatus>('idle');
 
-  // --- Initial Config Check ---
+  // --- Initial Config & Session Restore ---
   useEffect(() => {
     setIsConfigured(checkSupabaseConfig());
+    
+    // Attempt to restore session from localStorage
+    const restoreSession = async () => {
+      const savedId = localStorage.getItem('atpukur_user_id');
+      if (savedId && supabase) {
+        try {
+          const { data, error } = await supabase.from('users').select('*').eq('id', savedId).single();
+          if (data && !error) {
+            setCurrentUser(data as User);
+            // Optionally update online status immediately
+            await supabase.from('users').update({ is_online: true }).eq('id', savedId);
+          }
+        } catch (e) {
+          console.error("Session restore failed", e);
+          localStorage.removeItem('atpukur_user_id');
+        }
+      }
+      setIsRestoringSession(false);
+    };
+    
+    restoreSession();
   }, []);
 
   // Update Refs when state changes
@@ -91,6 +113,14 @@ export default function App() {
   useEffect(() => {
     callStatusRef.current = callStatus;
   }, [callStatus]);
+
+  // Attach remote stream to video element whenever hasRemoteVideo changes
+  useEffect(() => {
+    if (hasRemoteVideo && remoteVideoRef.current && remoteStreamRef.current) {
+        remoteVideoRef.current.srcObject = remoteStreamRef.current;
+        remoteVideoRef.current.play().catch(e => console.error("Error playing video:", e));
+    }
+  }, [hasRemoteVideo]);
 
   // --- Presence & User List Logic ---
   useEffect(() => {
@@ -178,54 +208,51 @@ export default function App() {
   useEffect(() => {
     if (!currentUser || !supabase) return;
 
-    // Use a unique channel name or ensure we don't conflict. 
-    // Using 'public:signaling' for broadcast.
     const signalingSub = supabase.channel('public:signaling')
       .on('broadcast', { event: 'signal' }, async ({ payload }) => {
         if (!payload || payload.targetId !== currentUser.id) return;
         
-        // Use Ref for current status to avoid closure staleness and re-subscription issues
         const currentStatus = callStatusRef.current;
+        // Check if this is a renegotiation (we are connected and have a PC)
+        const isRenegotiation = currentStatus === 'connected' && !!peerConnectionRef.current;
 
-        // Handle Offer (Incoming Call or Renegotiation)
+        // Handle Offer
         if (payload.type === 'offer') {
-          const isRenegotiation = currentStatus === 'connected' && !!peerConnectionRef.current;
-          
-          if (currentStatus !== 'idle' && !isRenegotiation) {
-            // Busy line
+          if (currentStatus !== 'idle' && !isRenegotiation && currentStatus !== 'incoming') {
+            // Already in a call with someone else
             return;
           }
 
           if (isRenegotiation) {
-             // Handle Renegotiation (e.g. adding screen share)
-             if (peerConnectionRef.current) {
-                // Check signaling state to avoid errors
-                if (peerConnectionRef.current.signalingState !== "stable") {
-                    // Collision handling could go here, for now we assume sequential
-                    await Promise.all([
-                        peerConnectionRef.current.setLocalDescription({type: "rollback"}),
-                        peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp))
-                    ]);
-                } else {
-                    await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-                }
-                
-                const answer = await peerConnectionRef.current.createAnswer();
-                await peerConnectionRef.current.setLocalDescription(answer);
-                await supabase?.channel('public:signaling').send({
-                    type: 'broadcast',
-                    event: 'signal',
-                    payload: {
+             const pc = peerConnectionRef.current;
+             if (!pc) return;
+
+             // Handle glare or state mismatch
+             if (pc.signalingState !== "stable") {
+                 await Promise.all([
+                     pc.setLocalDescription({type: "rollback"}),
+                     pc.setRemoteDescription(new RTCSessionDescription(payload.sdp))
+                 ]);
+             } else {
+                 await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+             }
+             
+             const answer = await pc.createAnswer();
+             await pc.setLocalDescription(answer);
+             
+             await supabase?.channel('public:signaling').send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: {
                     type: 'answer',
                     targetId: payload.caller.id,
                     sdp: answer
-                    }
-                });
-             }
+                }
+             });
              return;
           }
 
-          // Incoming Call
+          // New Call
           const caller = payload.caller;
           setIncomingCallUser(caller);
           setCallStatus('incoming');
@@ -235,10 +262,13 @@ export default function App() {
           await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
         }
 
-        // Handle Answer (Call Accepted or Renegotiation Accepted)
+        // Handle Answer
         if (payload.type === 'answer') {
-           if (peerConnectionRef.current) {
-             await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+           const pc = peerConnectionRef.current;
+           if (pc) {
+             // We can accept answer even if not "stable" if we are the offerer
+             await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+             
              if (currentStatus !== 'connected') {
                 setCallStatus('connected');
                 startCallTimer();
@@ -267,7 +297,7 @@ export default function App() {
     return () => {
       supabase.removeChannel(signalingSub);
     };
-  }, [currentUser]); // Dependency removed on callStatus to prevent re-subscription
+  }, [currentUser]);
 
   // --- WebRTC Functions ---
 
@@ -289,33 +319,30 @@ export default function App() {
     };
 
     pc.ontrack = (event) => {
-      const stream = event.streams[0];
+      console.log("Track received:", event.track.kind);
+      // If we receive a track, we use the stream provided by the event
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      
+      // Always update remote stream ref
       remoteStreamRef.current = stream;
 
-      // Handle Video (Screen Share)
       if (event.track.kind === 'video') {
+         console.log("Video track detected");
          setHasRemoteVideo(true);
-         setTimeout(() => {
-             if (remoteVideoRef.current) {
-                remoteVideoRef.current.srcObject = stream;
-                remoteVideoRef.current.play().catch(console.error);
-             }
-         }, 100);
          
          event.track.onended = () => {
+             console.log("Video track ended");
              setHasRemoteVideo(false);
          };
-      }
-      
-      // Handle Audio
-      if (event.track.kind === 'audio') {
+      } else if (event.track.kind === 'audio') {
           if (remoteAudioRef.current) {
             remoteAudioRef.current.srcObject = stream;
-            remoteAudioRef.current.play().catch(console.error);
+            remoteAudioRef.current.play().catch(e => console.error("Error playing audio:", e));
           }
       }
     };
 
+    // Add local tracks if they exist
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => {
         pc.addTrack(track, localStreamRef.current!);
@@ -363,6 +390,7 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStreamRef.current = stream;
 
+      // Add local tracks to the existing PC (created when offer arrived)
       stream.getTracks().forEach(track => {
         if (peerConnectionRef.current) {
           peerConnectionRef.current.addTrack(track, stream);
@@ -393,25 +421,24 @@ export default function App() {
   const stopScreenShare = async () => {
     if (!peerConnectionRef.current || !isScreenSharing) return;
     
-    // Find sender with video track
+    // Stop tracks
     const senders = peerConnectionRef.current.getSenders();
-    const sender = senders.find(s => s.track?.kind === 'video');
-    
-    if (sender) {
-      peerConnectionRef.current.removeTrack(sender);
+    const videoSender = senders.find(s => s.track?.kind === 'video');
+    if (videoSender) {
+        peerConnectionRef.current.removeTrack(videoSender);
     }
-    
-    // Stop local video tracks
+
     if (localStreamRef.current) {
-       localStreamRef.current.getVideoTracks().forEach(t => {
-           t.stop();
-           localStreamRef.current?.removeTrack(t);
-       });
+        const videoTracks = localStreamRef.current.getVideoTracks();
+        videoTracks.forEach(t => {
+            t.stop();
+            localStreamRef.current?.removeTrack(t);
+        });
     }
 
     setIsScreenSharing(false);
 
-    // Renegotiate to inform remote that video is gone
+    // Negotiate removal
     try {
       const offer = await peerConnectionRef.current.createOffer();
       await peerConnectionRef.current.setLocalDescription(offer);
@@ -430,12 +457,13 @@ export default function App() {
           });
       }
     } catch(e) {
-        console.error("Error renegotiating stop screen share", e);
+        console.error("Error stopping screen share:", e);
     }
   };
 
   const startScreenShare = async () => {
      if (!peerConnectionRef.current) return;
+     const pc = peerConnectionRef.current;
 
      try {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -446,21 +474,16 @@ export default function App() {
         };
 
         if (localStreamRef.current) {
-            // Add track to local stream
             localStreamRef.current.addTrack(screenTrack);
-            // Add track to PeerConnection
-            peerConnectionRef.current.addTrack(screenTrack, localStreamRef.current);
+            // Add track to PC
+            pc.addTrack(screenTrack, localStreamRef.current);
         }
 
         setIsScreenSharing(true);
 
-        // Renegotiate
-        const offer = await peerConnectionRef.current.createOffer();
-        await peerConnectionRef.current.setLocalDescription(offer);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
         
-        // Determine target ID (we are sending the offer)
-        // If we initiated the call, activeUser is set. 
-        // If we accepted the call, incomingCallUser is set.
         const targetId = activeUser?.id || incomingCallUser?.id;
         
         if (targetId) {
@@ -468,10 +491,10 @@ export default function App() {
                 type: 'broadcast',
                 event: 'signal',
                 payload: {
-                type: 'offer',
-                targetId: targetId,
-                caller: currentUser,
-                sdp: offer
+                    type: 'offer',
+                    targetId: targetId,
+                    caller: currentUser,
+                    sdp: offer
                 }
             });
         }
@@ -602,19 +625,23 @@ export default function App() {
         }
       } else {
         if (!existingUser) {
-          setLoginError("ACCESS DENIED: Identity not recognized.");
+          setLoginError("ACCESS DENIED: IDENTITY UNKNOWN");
           return;
         }
       }
+      
+      // Save session
+      localStorage.setItem('atpukur_user_id', existingUser.id);
       setCurrentUser(existingUser as User);
     } catch (err: any) {
       console.error("Login Error:", err);
-      setLoginError(err.message || "Connection failed");
+      setLoginError(err.message || "UPLINK FAILED");
     }
   };
 
   const handleLogout = async () => {
     if (currentUser && supabase) await supabase.from('users').update({ is_online: false }).eq('id', currentUser.id);
+    localStorage.removeItem('atpukur_user_id');
     setCurrentUser(null);
     setActiveUser(null);
     setMessages([]);
@@ -667,47 +694,129 @@ export default function App() {
   // --- Render ---
 
   if (!isConfigured) return <div className="p-10 text-red-500">Supabase Config Missing</div>;
+  
+  if (isRestoringSession) {
+      return (
+        <div className="h-[100dvh] bg-black flex flex-col items-center justify-center">
+            <div className="w-16 h-16 border-4 border-neon-green/20 border-t-neon-green rounded-full animate-spin"></div>
+            <div className="mt-4 font-mono text-neon-green text-sm tracking-widest animate-pulse">RESTORING UPLINK...</div>
+        </div>
+      );
+  }
 
   if (!currentUser) {
     return (
-      <div className="h-[100dvh] flex items-center justify-center p-4 relative overflow-hidden bg-black">
-        {/* Cyberpunk Login Background */}
-        <div className="absolute inset-0 pointer-events-none">
-           <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-neon-green/10 rounded-full blur-[100px] animate-pulse-slow"></div>
-           <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-neon-purple/10 rounded-full blur-[100px] animate-pulse-slow" style={{ animationDelay: '1s'}}></div>
-           <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20"></div>
+      <div className="h-[100dvh] flex flex-col items-center justify-center p-4 relative overflow-hidden bg-black text-white font-mono selection:bg-neon-green selection:text-black">
+        {/* Style Injection for Hacker Effects */}
+        <style>{`
+          @keyframes glitch-anim-1 {
+            0% { clip-path: inset(20% 0 80% 0); transform: translate(-2px, 1px); }
+            20% { clip-path: inset(60% 0 10% 0); transform: translate(2px, -1px); }
+            40% { clip-path: inset(40% 0 50% 0); transform: translate(-2px, 2px); }
+            60% { clip-path: inset(80% 0 5% 0); transform: translate(2px, -2px); }
+            80% { clip-path: inset(10% 0 70% 0); transform: translate(-1px, 1px); }
+            100% { clip-path: inset(30% 0 50% 0); transform: translate(1px, -1px); }
+          }
+          .glitch-title { position: relative; }
+          .glitch-title::before, .glitch-title::after {
+            content: attr(data-text);
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+          }
+          .glitch-title::before {
+            left: 2px; text-shadow: -1px 0 #00ff41; background: black;
+            animation: glitch-anim-1 2s infinite linear alternate-reverse;
+          }
+          .glitch-title::after {
+            left: -2px; text-shadow: -1px 0 #bc13fe; background: black;
+            animation: glitch-anim-1 3s infinite linear alternate-reverse;
+          }
+          .scanline {
+            background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0,0,0,0.2) 50%, rgba(0,0,0,0.2));
+            background-size: 100% 4px;
+            animation: scanline 10s linear infinite;
+            pointer-events: none;
+          }
+        `}</style>
+
+        {/* Dynamic Background */}
+        <div className="absolute inset-0 pointer-events-none z-0">
+           {/* Animated Grid */}
+           <div className="absolute inset-0 bg-[linear-gradient(rgba(0,255,65,0.05)_1px,transparent_1px),linear-gradient(90deg,rgba(0,255,65,0.05)_1px,transparent_1px)] bg-[size:50px_50px] [mask-image:radial-gradient(ellipse_at_center,black_40%,transparent_100%)]"></div>
+           {/* Floating Particles */}
+           <div className="absolute top-1/4 left-1/4 w-64 h-64 bg-neon-green/10 rounded-full blur-[80px] animate-pulse"></div>
+           <div className="absolute bottom-1/4 right-1/4 w-64 h-64 bg-neon-purple/10 rounded-full blur-[80px] animate-pulse" style={{animationDelay: '1s'}}></div>
+           {/* Noise Overlay */}
+           <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-10 mix-blend-overlay"></div>
+           {/* Scanline Overlay */}
+           <div className="absolute inset-0 scanline z-50"></div>
         </div>
         
-        <GlassCard className="max-w-sm w-full p-8 z-10 border-neon-green/30 shadow-[0_0_50px_rgba(0,255,65,0.1)]">
-          <div className="text-center mb-8">
-            <h1 className="text-3xl font-mono font-bold text-white tracking-tight mb-1 animate-pulse">ATPUKUR BOYS</h1>
-            <p className="text-neon-green text-xs font-mono tracking-[0.3em] uppercase opacity-70">Secure Uplink v2.0</p>
-          </div>
-          
-          {loginError && (
-            <div className="mb-6 p-4 bg-red-500/20 border border-red-500/50 rounded-lg flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
-              <div className="text-xs text-red-200 font-mono text-left">{loginError}</div>
-            </div>
-          )}
+        <div className="max-w-md w-full relative z-10">
+           {/* Terminal Header */}
+           <div className="mb-8 text-center relative">
+              <div className="inline-block p-4 border border-neon-green/30 bg-black/50 backdrop-blur-sm rounded-lg mb-6 shadow-[0_0_30px_rgba(0,255,65,0.1)]">
+                 <Terminal className="w-12 h-12 text-neon-green animate-pulse" />
+              </div>
+              <h1 className="text-4xl md:text-5xl font-bold tracking-tighter mb-2 glitch-title text-white" data-text="ATPUKUR BOYS">
+                ATPUKUR BOYS
+              </h1>
+              <div className="flex items-center justify-center gap-2 text-xs tracking-[0.4em] text-gray-500 uppercase">
+                 <span className="w-2 h-2 bg-neon-green rounded-full animate-ping"></span>
+                 Secure Uplink v2.0
+              </div>
+           </div>
 
-          <form onSubmit={handleLogin} className="space-y-6">
-            <div>
-              <label className="text-xs font-mono text-gray-500 mb-2 block ml-1">OPERATIVE_ID</label>
-              <Input 
-                autoFocus
-                placeholder="Enter Alias..." 
-                value={loginUsername}
-                onChange={(e) => setLoginUsername(e.target.value)}
-                className="bg-black/50 border-white/20 focus:border-neon-green"
-              />
-            </div>
-            <NeonButton type="submit" className="w-full justify-center group relative overflow-hidden">
-              <span className="relative z-10">INITIALIZE_SESSION</span>
-              <div className="absolute inset-0 bg-neon-green/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
-            </NeonButton>
-          </form>
-        </GlassCard>
+           {/* Login Card */}
+           <div className="bg-black/40 border border-white/10 backdrop-blur-xl p-8 rounded-xl shadow-2xl relative overflow-hidden group">
+              {/* Card Decoration */}
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-neon-green to-transparent opacity-50"></div>
+              <div className="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-neon-green/50 rounded-br-lg"></div>
+              <div className="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-neon-green/50 rounded-tl-lg"></div>
+              
+              {loginError && (
+                <div className="mb-6 p-3 bg-red-900/20 border border-red-500/50 rounded flex items-center gap-3 animate-in slide-in-from-top-2">
+                   <AlertTriangle className="w-4 h-4 text-red-500" />
+                   <span className="text-xs text-red-400 font-mono tracking-wide">{loginError}</span>
+                </div>
+              )}
+
+              <form onSubmit={handleLogin} className="space-y-6">
+                <div className="space-y-2">
+                  <label className="text-[10px] uppercase tracking-widest text-gray-500 ml-1">Identify Yourself</label>
+                  <div className="relative group/input">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-neon-green font-mono text-sm pointer-events-none">{">_"}</span>
+                    <input 
+                      autoFocus
+                      type="text"
+                      placeholder="ENTER_ALIAS" 
+                      value={loginUsername}
+                      onChange={(e) => setLoginUsername(e.target.value)}
+                      className="w-full bg-black/50 border border-white/20 rounded-lg py-4 pl-10 pr-4 text-white font-mono text-sm focus:outline-none focus:border-neon-green focus:shadow-[0_0_20px_rgba(0,255,65,0.2)] transition-all placeholder-gray-700"
+                    />
+                    <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                       <Cpu className="w-4 h-4 text-gray-600 group-focus-within/input:text-neon-green transition-colors" />
+                    </div>
+                  </div>
+                </div>
+
+                <button 
+                  type="submit" 
+                  className="w-full bg-neon-green/10 border border-neon-green/50 text-neon-green py-4 rounded-lg font-mono font-bold tracking-widest uppercase hover:bg-neon-green hover:text-black transition-all duration-300 hover:shadow-[0_0_30px_rgba(0,255,65,0.4)] relative overflow-hidden group/btn"
+                >
+                  <span className="relative z-10 flex items-center justify-center gap-2">
+                    Initialize Connection <ChevronLeft className="w-4 h-4 rotate-180" />
+                  </span>
+                  <div className="absolute inset-0 bg-neon-green/20 -translate-x-full group-hover/btn:translate-x-0 transition-transform duration-300"></div>
+                </button>
+              </form>
+
+              <div className="mt-6 text-center">
+                 <p className="text-[10px] text-gray-600 font-mono">
+                    ENCRYPTION: AES-256-GCM // SERVER: ON-LINE
+                 </p>
+              </div>
+           </div>
+        </div>
       </div>
     );
   }
