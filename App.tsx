@@ -64,6 +64,7 @@ export default function App() {
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const callTimerRef = useRef<any>(null);
+  const callStatusRef = useRef<CallStatus>('idle');
 
   // --- Initial Config Check ---
   useEffect(() => {
@@ -85,6 +86,11 @@ export default function App() {
       });
     }
   }, [activeUser, currentUser]);
+
+  // Sync state to ref for Event Listeners
+  useEffect(() => {
+    callStatusRef.current = callStatus;
+  }, [callStatus]);
 
   // --- Presence & User List Logic ---
   useEffect(() => {
@@ -172,33 +178,50 @@ export default function App() {
   useEffect(() => {
     if (!currentUser || !supabase) return;
 
+    // Use a unique channel name or ensure we don't conflict. 
+    // Using 'public:signaling' for broadcast.
     const signalingSub = supabase.channel('public:signaling')
       .on('broadcast', { event: 'signal' }, async ({ payload }) => {
         if (!payload || payload.targetId !== currentUser.id) return;
+        
+        // Use Ref for current status to avoid closure staleness and re-subscription issues
+        const currentStatus = callStatusRef.current;
 
         // Handle Offer (Incoming Call or Renegotiation)
         if (payload.type === 'offer') {
-          const isRenegotiation = callStatus === 'connected' && peerConnectionRef.current;
+          const isRenegotiation = currentStatus === 'connected' && !!peerConnectionRef.current;
           
-          if (callStatus !== 'idle' && !isRenegotiation) {
+          if (currentStatus !== 'idle' && !isRenegotiation) {
             // Busy line
             return;
           }
 
           if (isRenegotiation) {
              // Handle Renegotiation (e.g. adding screen share)
-             await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-             const answer = await peerConnectionRef.current.createAnswer();
-             await peerConnectionRef.current.setLocalDescription(answer);
-             await supabase?.channel('public:signaling').send({
-                type: 'broadcast',
-                event: 'signal',
-                payload: {
-                  type: 'answer',
-                  targetId: payload.caller.id,
-                  sdp: answer
+             if (peerConnectionRef.current) {
+                // Check signaling state to avoid errors
+                if (peerConnectionRef.current.signalingState !== "stable") {
+                    // Collision handling could go here, for now we assume sequential
+                    await Promise.all([
+                        peerConnectionRef.current.setLocalDescription({type: "rollback"}),
+                        peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp))
+                    ]);
+                } else {
+                    await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
                 }
-             });
+                
+                const answer = await peerConnectionRef.current.createAnswer();
+                await peerConnectionRef.current.setLocalDescription(answer);
+                await supabase?.channel('public:signaling').send({
+                    type: 'broadcast',
+                    event: 'signal',
+                    payload: {
+                    type: 'answer',
+                    targetId: payload.caller.id,
+                    sdp: answer
+                    }
+                });
+             }
              return;
           }
 
@@ -216,7 +239,7 @@ export default function App() {
         if (payload.type === 'answer') {
            if (peerConnectionRef.current) {
              await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-             if (callStatus !== 'connected') {
+             if (currentStatus !== 'connected') {
                 setCallStatus('connected');
                 startCallTimer();
              }
@@ -244,7 +267,7 @@ export default function App() {
     return () => {
       supabase.removeChannel(signalingSub);
     };
-  }, [currentUser, callStatus]);
+  }, [currentUser]); // Dependency removed on callStatus to prevent re-subscription
 
   // --- WebRTC Functions ---
 
@@ -272,13 +295,13 @@ export default function App() {
       // Handle Video (Screen Share)
       if (event.track.kind === 'video') {
          setHasRemoteVideo(true);
-         if (remoteVideoRef.current) {
-            remoteVideoRef.current.srcObject = stream;
-            // Force play on video element sometimes needed
-            remoteVideoRef.current.play().catch(console.error);
-         }
+         setTimeout(() => {
+             if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = stream;
+                remoteVideoRef.current.play().catch(console.error);
+             }
+         }, 100);
          
-         // Listen for when video stops
          event.track.onended = () => {
              setHasRemoteVideo(false);
          };
@@ -288,6 +311,7 @@ export default function App() {
       if (event.track.kind === 'audio') {
           if (remoteAudioRef.current) {
             remoteAudioRef.current.srcObject = stream;
+            remoteAudioRef.current.play().catch(console.error);
           }
       }
     };
@@ -417,13 +441,14 @@ export default function App() {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
         const screenTrack = screenStream.getVideoTracks()[0];
         
-        // Handle browser "Stop sharing" button
         screenTrack.onended = () => {
              stopScreenShare();
         };
 
         if (localStreamRef.current) {
+            // Add track to local stream
             localStreamRef.current.addTrack(screenTrack);
+            // Add track to PeerConnection
             peerConnectionRef.current.addTrack(screenTrack, localStreamRef.current);
         }
 
@@ -433,19 +458,26 @@ export default function App() {
         const offer = await peerConnectionRef.current.createOffer();
         await peerConnectionRef.current.setLocalDescription(offer);
         
+        // Determine target ID (we are sending the offer)
+        // If we initiated the call, activeUser is set. 
+        // If we accepted the call, incomingCallUser is set.
         const targetId = activeUser?.id || incomingCallUser?.id;
-        await supabase?.channel('public:signaling').send({
-            type: 'broadcast',
-            event: 'signal',
-            payload: {
-              type: 'offer',
-              targetId: targetId,
-              caller: currentUser,
-              sdp: offer
-            }
-        });
+        
+        if (targetId) {
+            await supabase?.channel('public:signaling').send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: {
+                type: 'offer',
+                targetId: targetId,
+                caller: currentUser,
+                sdp: offer
+                }
+            });
+        }
      } catch (e) {
         console.error("Failed to share screen", e);
+        setIsScreenSharing(false);
      }
   };
 
@@ -503,6 +535,7 @@ export default function App() {
   };
 
   const startCallTimer = () => {
+    if (callTimerRef.current) clearInterval(callTimerRef.current);
     setCallDuration(0);
     callTimerRef.current = setInterval(() => {
       setCallDuration(prev => prev + 1);
