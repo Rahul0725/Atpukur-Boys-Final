@@ -3,7 +3,7 @@ import { supabase, checkSupabaseConfig } from './supabaseClient';
 import { User, Message } from './types';
 import { GlassCard, NeonButton, Input, Badge } from './components/Layout';
 import { AdminDashboard } from './components/AdminDashboard';
-import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell } from 'lucide-react';
+import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Monitor, MonitorOff } from 'lucide-react';
 
 // Constant for the Group Chat "User" placeholder
 const GROUP_CHAT_ID = 'global_public_channel';
@@ -16,6 +16,15 @@ const GROUP_CHAT_USER: User = {
   last_seen: new Date().toISOString(),
   created_at: new Date().toISOString()
 };
+
+// WebRTC Configuration
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" }
+  ]
+};
+
+type CallStatus = 'idle' | 'calling' | 'incoming' | 'connected';
 
 export default function App() {
   // State
@@ -30,6 +39,14 @@ export default function App() {
   // Notification State
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   
+  // Voice & Video Chat State
+  const [callStatus, setCallStatus] = useState<CallStatus>('idle');
+  const [incomingCallUser, setIncomingCallUser] = useState<User | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
+  const [callDuration, setCallDuration] = useState(0);
+
   // Login State
   const [loginUsername, setLoginUsername] = useState('');
   const [isConfigured, setIsConfigured] = useState(true);
@@ -37,9 +54,16 @@ export default function App() {
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // Ref to track active user inside the subscription callback without re-subscribing
   const activeUserRef = useRef<User | null>(null);
   const currentUserRef = useRef<User | null>(null);
+  
+  // WebRTC Refs
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const callTimerRef = useRef<any>(null);
 
   // --- Initial Config Check ---
   useEffect(() => {
@@ -101,7 +125,6 @@ export default function App() {
   useEffect(() => {
     if (!currentUser || !supabase) return;
 
-    // We use a SINGLE global subscription to handle both active chat updates AND background notifications
     const msgSub = supabase
       .channel('global_messages')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
@@ -111,38 +134,30 @@ export default function App() {
         
         if (!me) return;
 
-        // 1. Identify the conversation ID this message belongs to
         const isGroupMsg = newMsg.receiver_id === null;
         let conversationId = '';
 
         if (isGroupMsg) {
           conversationId = GROUP_CHAT_ID;
         } else {
-          // Direct Message: If I sent it, convo is receiver. If I received it, convo is sender.
           conversationId = newMsg.sender_id === me.id ? newMsg.receiver_id! : newMsg.sender_id;
         }
 
-        // 2. Check if this message is relevant to me at all
         const isForMe = newMsg.receiver_id === me.id;
         const isFromMe = newMsg.sender_id === me.id;
         const isGlobal = isGroupMsg;
 
-        if (!isForMe && !isFromMe && !isGlobal) return; // Ignore messages between two other people
+        if (!isForMe && !isFromMe && !isGlobal) return;
 
-        // 3. Logic: Update Chat View OR Update Badge
         if (currentActive && currentActive.id === conversationId) {
-          // We are currently viewing this chat -> Add to messages list
           setMessages(prev => [...prev, newMsg]);
           scrollToBottom();
         } else {
-          // We are NOT viewing this chat -> Add notification (unless I sent it)
           if (!isFromMe) {
             setUnreadCounts(prev => ({
               ...prev,
               [conversationId]: (prev[conversationId] || 0) + 1
             }));
-            
-            // Optional: Play a sound here if desired
           }
         }
       })
@@ -153,14 +168,357 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // --- Fetch History when Active Chat Changes ---
+  // --- Signaling Listener (Voice + Screen) ---
   useEffect(() => {
-    if (activeUser) {
-      fetchMessages();
-    }
-  }, [activeUser]);
+    if (!currentUser || !supabase) return;
 
-  // --- Actions ---
+    const signalingSub = supabase.channel('public:signaling')
+      .on('broadcast', { event: 'signal' }, async ({ payload }) => {
+        if (!payload || payload.targetId !== currentUser.id) return;
+
+        // Handle Offer (Incoming Call or Renegotiation)
+        if (payload.type === 'offer') {
+          const isRenegotiation = callStatus === 'connected' && peerConnectionRef.current;
+          
+          if (callStatus !== 'idle' && !isRenegotiation) {
+            // Busy line
+            return;
+          }
+
+          if (isRenegotiation) {
+             // Handle Renegotiation (e.g. adding screen share)
+             await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+             const answer = await peerConnectionRef.current.createAnswer();
+             await peerConnectionRef.current.setLocalDescription(answer);
+             await supabase?.channel('public:signaling').send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: {
+                  type: 'answer',
+                  targetId: payload.caller.id,
+                  sdp: answer
+                }
+             });
+             return;
+          }
+
+          // Incoming Call
+          const caller = payload.caller;
+          setIncomingCallUser(caller);
+          setCallStatus('incoming');
+          
+          const pc = createPeerConnection(caller.id);
+          peerConnectionRef.current = pc;
+          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+        }
+
+        // Handle Answer (Call Accepted or Renegotiation Accepted)
+        if (payload.type === 'answer') {
+           if (peerConnectionRef.current) {
+             await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+             if (callStatus !== 'connected') {
+                setCallStatus('connected');
+                startCallTimer();
+             }
+           }
+        }
+
+        // Handle ICE Candidate
+        if (payload.type === 'ice-candidate') {
+          if (peerConnectionRef.current) {
+            try {
+              await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            } catch (e) {
+              console.error("Error adding ice candidate", e);
+            }
+          }
+        }
+
+        // Handle Hangup
+        if (payload.type === 'hangup') {
+          cleanupCall();
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(signalingSub);
+    };
+  }, [currentUser, callStatus]);
+
+  // --- WebRTC Functions ---
+
+  const createPeerConnection = (targetUserId: string) => {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        supabase?.channel('public:signaling').send({
+          type: 'broadcast',
+          event: 'signal',
+          payload: {
+            type: 'ice-candidate',
+            targetId: targetUserId,
+            candidate: event.candidate
+          }
+        });
+      }
+    };
+
+    pc.ontrack = (event) => {
+      const stream = event.streams[0];
+      remoteStreamRef.current = stream;
+
+      // Handle Video (Screen Share)
+      if (event.track.kind === 'video') {
+         setHasRemoteVideo(true);
+         if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = stream;
+            // Force play on video element sometimes needed
+            remoteVideoRef.current.play().catch(console.error);
+         }
+         
+         // Listen for when video stops
+         event.track.onended = () => {
+             setHasRemoteVideo(false);
+         };
+      }
+      
+      // Handle Audio
+      if (event.track.kind === 'audio') {
+          if (remoteAudioRef.current) {
+            remoteAudioRef.current.srcObject = stream;
+          }
+      }
+    };
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current!);
+      });
+    }
+
+    return pc;
+  };
+
+  const startCall = async () => {
+    if (!activeUser || !currentUser) return;
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = stream;
+      
+      const pc = createPeerConnection(activeUser.id);
+      peerConnectionRef.current = pc;
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      await supabase?.channel('public:signaling').send({
+        type: 'broadcast',
+        event: 'signal',
+        payload: {
+          type: 'offer',
+          targetId: activeUser.id,
+          caller: currentUser,
+          sdp: offer
+        }
+      });
+
+      setCallStatus('calling');
+    } catch (err) {
+      console.error("Error starting call:", err);
+      alert("Could not access microphone.");
+    }
+  };
+
+  const answerCall = async () => {
+    if (!incomingCallUser || !currentUser || !peerConnectionRef.current) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = stream;
+
+      stream.getTracks().forEach(track => {
+        if (peerConnectionRef.current) {
+          peerConnectionRef.current.addTrack(track, stream);
+        }
+      });
+
+      const answer = await peerConnectionRef.current.createAnswer();
+      await peerConnectionRef.current.setLocalDescription(answer);
+
+      await supabase?.channel('public:signaling').send({
+        type: 'broadcast',
+        event: 'signal',
+        payload: {
+          type: 'answer',
+          targetId: incomingCallUser.id,
+          sdp: answer
+        }
+      });
+
+      setCallStatus('connected');
+      startCallTimer();
+    } catch (err) {
+      console.error("Error answering call:", err);
+      cleanupCall();
+    }
+  };
+
+  const stopScreenShare = async () => {
+    if (!peerConnectionRef.current || !isScreenSharing) return;
+    
+    // Find sender with video track
+    const senders = peerConnectionRef.current.getSenders();
+    const sender = senders.find(s => s.track?.kind === 'video');
+    
+    if (sender) {
+      peerConnectionRef.current.removeTrack(sender);
+    }
+    
+    // Stop local video tracks
+    if (localStreamRef.current) {
+       localStreamRef.current.getVideoTracks().forEach(t => {
+           t.stop();
+           localStreamRef.current?.removeTrack(t);
+       });
+    }
+
+    setIsScreenSharing(false);
+
+    // Renegotiate to inform remote that video is gone
+    try {
+      const offer = await peerConnectionRef.current.createOffer();
+      await peerConnectionRef.current.setLocalDescription(offer);
+      
+      const targetId = activeUser?.id || incomingCallUser?.id;
+      if (targetId) {
+          await supabase?.channel('public:signaling').send({
+            type: 'broadcast',
+            event: 'signal',
+            payload: {
+              type: 'offer',
+              targetId: targetId,
+              caller: currentUser,
+              sdp: offer
+            }
+          });
+      }
+    } catch(e) {
+        console.error("Error renegotiating stop screen share", e);
+    }
+  };
+
+  const startScreenShare = async () => {
+     if (!peerConnectionRef.current) return;
+
+     try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        const screenTrack = screenStream.getVideoTracks()[0];
+        
+        // Handle browser "Stop sharing" button
+        screenTrack.onended = () => {
+             stopScreenShare();
+        };
+
+        if (localStreamRef.current) {
+            localStreamRef.current.addTrack(screenTrack);
+            peerConnectionRef.current.addTrack(screenTrack, localStreamRef.current);
+        }
+
+        setIsScreenSharing(true);
+
+        // Renegotiate
+        const offer = await peerConnectionRef.current.createOffer();
+        await peerConnectionRef.current.setLocalDescription(offer);
+        
+        const targetId = activeUser?.id || incomingCallUser?.id;
+        await supabase?.channel('public:signaling').send({
+            type: 'broadcast',
+            event: 'signal',
+            payload: {
+              type: 'offer',
+              targetId: targetId,
+              caller: currentUser,
+              sdp: offer
+            }
+        });
+     } catch (e) {
+        console.error("Failed to share screen", e);
+     }
+  };
+
+  const toggleScreenShare = () => {
+     if (isScreenSharing) {
+        stopScreenShare();
+     } else {
+        startScreenShare();
+     }
+  };
+
+  const endCall = () => {
+    const targetId = activeUser?.id || incomingCallUser?.id;
+    if (targetId) {
+       supabase?.channel('public:signaling').send({
+        type: 'broadcast',
+        event: 'signal',
+        payload: {
+          type: 'hangup',
+          targetId: targetId
+        }
+      });
+    }
+    cleanupCall();
+  };
+
+  const cleanupCall = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+    setCallStatus('idle');
+    setIncomingCallUser(null);
+    setCallDuration(0);
+    setIsMuted(false);
+    setIsScreenSharing(false);
+    setHasRemoteVideo(false);
+  };
+
+  const toggleMute = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach(track => {
+        track.enabled = !track.enabled;
+      });
+      setIsMuted(!isMuted);
+    }
+  };
+
+  const startCallTimer = () => {
+    setCallDuration(0);
+    callTimerRef.current = setInterval(() => {
+      setCallDuration(prev => prev + 1);
+    }, 1000);
+  };
+
+  const formatDuration = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // --- Fetch History ---
+  useEffect(() => {
+    if (activeUser) fetchMessages();
+  }, [activeUser]);
 
   const fetchUsers = async () => {
     if (!supabase) return;
@@ -170,17 +528,13 @@ export default function App() {
 
   const fetchMessages = async () => {
     if (!supabase || !currentUser || !activeUser) return;
-    
     let query = supabase.from('messages').select('*');
-
     if (activeUser.id === GROUP_CHAT_ID) {
       query = query.is('receiver_id', null);
     } else {
       query = query.or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeUser.id}),and(sender_id.eq.${activeUser.id},receiver_id.eq.${currentUser.id})`);
     }
-
     const { data } = await query.order('created_at', { ascending: true });
-    
     if (data) {
       setMessages(data as Message[]);
       scrollToBottom();
@@ -197,35 +551,18 @@ export default function App() {
     e.preventDefault();
     setLoginError(null);
     if (!supabase) return;
-    
     const inputName = loginUsername.trim();
     if (!inputName) return;
 
     try {
-      let { data: existingUser, error: fetchError } = await supabase
-        .from('users')
-        .select('*')
-        .eq('username', inputName)
-        .single();
-
+      let { data: existingUser, error: fetchError } = await supabase.from('users').select('*').eq('username', inputName).single();
       if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
 
-      // Security / Admin Logic
       if (inputName === 'habib') {
         if (!existingUser) {
-           const { data: adminUser, error: createError } = await supabase
-            .from('users')
-            .insert({
-              username: 'habib',
-              role: 'admin',
-              can_send: true,
-              is_online: true,
-              last_seen: new Date().toISOString()
-            })
-            .select()
-            .single();
-            if (createError) throw createError;
-            existingUser = adminUser;
+           const { data: adminUser, error: createError } = await supabase.from('users').insert({ username: 'habib', role: 'admin', can_send: true, is_online: true, last_seen: new Date().toISOString() }).select().single();
+           if (createError) throw createError;
+           existingUser = adminUser;
         } else if (existingUser.role !== 'admin') {
             await supabase.from('users').update({ role: 'admin' }).eq('id', existingUser.id);
             existingUser.role = 'admin';
@@ -236,7 +573,6 @@ export default function App() {
           return;
         }
       }
-
       setCurrentUser(existingUser as User);
     } catch (err: any) {
       console.error("Login Error:", err);
@@ -245,9 +581,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    if (currentUser && supabase) {
-      await supabase.from('users').update({ is_online: false }).eq('id', currentUser.id);
-    }
+    if (currentUser && supabase) await supabase.from('users').update({ is_online: false }).eq('id', currentUser.id);
     setCurrentUser(null);
     setActiveUser(null);
     setMessages([]);
@@ -258,11 +592,7 @@ export default function App() {
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!supabase || !currentUser || !activeUser || !inputText.trim()) return;
-
-    if (!currentUser.can_send) {
-      alert("Messaging disabled by admin.");
-      return;
-    }
+    if (!currentUser.can_send) { alert("Messaging disabled by admin."); return; }
 
     const payload = {
       sender_id: currentUser.id,
@@ -270,15 +600,8 @@ export default function App() {
       username: currentUser.username,
       message: inputText.trim()
     };
-
     const { error } = await supabase.from('messages').insert(payload);
-
-    if (error) {
-      console.error(error);
-      alert("Failed to send message.");
-    } else {
-      setInputText('');
-    }
+    if (error) { console.error(error); alert("Failed to send message."); } else { setInputText(''); }
   };
 
   const getInitials = (name: string) => name.substring(0, 2).toUpperCase();
@@ -333,6 +656,8 @@ export default function App() {
 
   return (
     <div className="h-[100dvh] flex flex-col md:flex-row bg-black relative overflow-hidden">
+      <audio ref={remoteAudioRef} autoPlay />
+      
       {/* App Background */}
       <div className="absolute inset-0 pointer-events-none z-0">
           <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-neon-blue/5 rounded-full blur-[120px]"></div>
@@ -341,6 +666,89 @@ export default function App() {
       </div>
 
       {showAdmin && <AdminDashboard onClose={() => setShowAdmin(false)} />}
+
+      {/* CALL OVERLAY UI */}
+      {callStatus !== 'idle' && (
+        <div className={`fixed inset-0 z-50 flex flex-col items-center justify-center p-4 animate-in fade-in duration-300 ${hasRemoteVideo ? 'bg-black' : 'bg-black/80 backdrop-blur-xl'}`}>
+           
+           {/* Remote Video Element */}
+           <video 
+              ref={remoteVideoRef} 
+              autoPlay 
+              playsInline 
+              className={`absolute inset-0 w-full h-full object-contain z-0 transition-opacity duration-500 ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`} 
+           />
+
+           {/* Decorative Background for Voice Call (Only when video is hidden) */}
+           {!hasRemoteVideo && (
+             <div className="absolute inset-0 pointer-events-none overflow-hidden z-0">
+                <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 rounded-full blur-[80px] opacity-20 animate-pulse ${callStatus === 'connected' ? 'bg-neon-green' : callStatus === 'calling' ? 'bg-neon-blue' : 'bg-neon-purple'}`}></div>
+             </div>
+           )}
+
+           <div className={`relative z-10 flex flex-col items-center w-full transition-all duration-500 ${hasRemoteVideo ? 'mt-auto mb-8 max-w-2xl bg-black/60 p-6 rounded-2xl backdrop-blur-md border border-white/10' : 'max-w-sm'}`}>
+              
+              {/* Avatar Ring (Hidden in full screen video mode or made smaller) */}
+              {!hasRemoteVideo && (
+                <div className="mb-8 relative">
+                   <div className="w-32 h-32 rounded-full bg-black border-2 border-white/10 flex items-center justify-center relative overflow-hidden shadow-2xl">
+                      <span className="font-mono text-4xl text-white font-bold">
+                         {getInitials((incomingCallUser?.username || activeUser?.username || "?"))}
+                      </span>
+                      {/* Ring Animation */}
+                      <div className={`absolute inset-0 border-4 rounded-full animate-[spin_3s_linear_infinite] ${callStatus === 'connected' ? 'border-t-neon-green border-r-transparent border-b-neon-green border-l-transparent' : 'border-t-neon-blue border-r-transparent border-b-neon-blue border-l-transparent opacity-50'}`}></div>
+                   </div>
+                   {/* Status Badge */}
+                   <div className={`absolute -bottom-4 left-1/2 -translate-x-1/2 px-4 py-1 rounded-full text-[10px] font-mono font-bold tracking-[0.2em] border shadow-lg whitespace-nowrap ${
+                      callStatus === 'connected' ? 'bg-neon-green/20 text-neon-green border-neon-green' :
+                      callStatus === 'incoming' ? 'bg-neon-purple/20 text-neon-purple border-neon-purple animate-bounce' :
+                      'bg-neon-blue/20 text-neon-blue border-neon-blue'
+                   }`}>
+                      {callStatus === 'connected' ? formatDuration(callDuration) :
+                       callStatus === 'incoming' ? 'INCOMING SIGNAL' : 'ESTABLISHING UPLINK...'}
+                   </div>
+                </div>
+              )}
+
+              <h2 className={`font-mono text-white font-bold ${hasRemoteVideo ? 'text-lg mb-0.5' : 'text-2xl mb-1'}`}>
+                  {incomingCallUser?.username || activeUser?.username}
+              </h2>
+              <p className={`font-mono text-gray-500 tracking-widest uppercase ${hasRemoteVideo ? 'text-[10px] mb-4' : 'text-xs mb-12'}`}>
+                 {callStatus === 'connected' ? (hasRemoteVideo ? 'VISUAL FEED ACTIVE' : 'VOICE CHANNEL SECURE') : 'ENCRYPTED CONNECTION'}
+              </p>
+
+              {/* Controls */}
+              <div className="flex items-center gap-6">
+                 {callStatus === 'incoming' ? (
+                   <>
+                      <button onClick={cleanupCall} className="w-16 h-16 rounded-full bg-red-500/20 text-red-500 border border-red-500 flex items-center justify-center hover:bg-red-500 hover:text-white transition-all shadow-[0_0_30px_rgba(239,68,68,0.3)]">
+                        <PhoneOff className="w-8 h-8" />
+                      </button>
+                      <button onClick={answerCall} className="w-16 h-16 rounded-full bg-neon-green/20 text-neon-green border border-neon-green flex items-center justify-center hover:bg-neon-green hover:text-black transition-all shadow-[0_0_30px_rgba(0,255,65,0.3)] animate-pulse">
+                        <Phone className="w-8 h-8" />
+                      </button>
+                   </>
+                 ) : (
+                   <>
+                     {callStatus === 'connected' && (
+                       <>
+                         <button onClick={toggleMute} className={`w-14 h-14 rounded-full border flex items-center justify-center transition-all ${isMuted ? 'bg-white text-black border-white' : 'bg-black/50 text-white border-white/20 hover:border-white'}`}>
+                            {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                         </button>
+                         <button onClick={toggleScreenShare} className={`w-14 h-14 rounded-full border flex items-center justify-center transition-all ${isScreenSharing ? 'bg-neon-blue text-black border-neon-blue' : 'bg-black/50 text-white border-white/20 hover:border-neon-blue hover:text-neon-blue'}`}>
+                            {isScreenSharing ? <MonitorOff className="w-6 h-6" /> : <Monitor className="w-6 h-6" />}
+                         </button>
+                       </>
+                     )}
+                     <button onClick={endCall} className="w-16 h-16 rounded-full bg-red-500 text-white border border-red-400 flex items-center justify-center hover:bg-red-600 transition-all shadow-[0_0_30px_rgba(239,68,68,0.5)]">
+                        <PhoneOff className="w-8 h-8" />
+                     </button>
+                   </>
+                 )}
+              </div>
+           </div>
+        </div>
+      )}
 
       {/* Sidebar */}
       <div className={`
@@ -508,6 +916,17 @@ export default function App() {
                   </div>
                 </div>
               </div>
+              
+              {/* Call Button (Private Chats Only) */}
+              {activeUser.id !== GROUP_CHAT_ID && currentUser.can_send && (
+                <button 
+                  onClick={startCall}
+                  className="p-2 text-neon-green bg-neon-green/10 border border-neon-green/30 rounded-lg hover:bg-neon-green hover:text-black transition-all hover:shadow-[0_0_10px_rgba(0,255,65,0.4)]"
+                  title="Initiate Encrypted Voice Uplink"
+                >
+                  <Phone className="w-5 h-5" />
+                </button>
+              )}
             </div>
 
             {/* Messages */}
