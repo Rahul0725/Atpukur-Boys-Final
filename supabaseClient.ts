@@ -33,15 +33,21 @@ export const checkSupabaseConfig = () => {
  *   created_at timestamptz default now()
  * );
  * 
- * -- 3. Create Messages Table
+ * -- 3. Create Messages Table (WITH CASCADE DELETE FOR USER MANAGEMENT)
  * create table if not exists messages (
  *   id uuid default gen_random_uuid() primary key,
  *   created_at timestamptz default now(),
- *   sender_id uuid references users(id),
- *   receiver_id uuid references users(id), -- null for group/global
+ *   sender_id uuid references users(id) on delete cascade,
+ *   receiver_id uuid references users(id) on delete cascade,
  *   username text not null,
  *   message text not null
  * );
+ * 
+ * -- IF TABLE EXISTS BUT USER DELETION FAILS, RUN THIS:
+ * -- alter table messages drop constraint if exists messages_sender_id_fkey;
+ * -- alter table messages drop constraint if exists messages_receiver_id_fkey;
+ * -- alter table messages add constraint messages_sender_id_fkey foreign key (sender_id) references users(id) on delete cascade;
+ * -- alter table messages add constraint messages_receiver_id_fkey foreign key (receiver_id) references users(id) on delete cascade;
  * 
  * -- 4. Enable Row Level Security (Public Access for this Demo)
  * alter table users enable row level security;

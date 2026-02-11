@@ -55,6 +55,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose }) => {
     fetchData();
   };
 
+  const handleDeleteUser = async (userId: string, username: string) => {
+    if (!supabase) return;
+    if (confirm(`CRITICAL: TERMINATE OPERATIVE "${username}"? This will expunge their identity and ALL associated communications.`)) {
+        setLoading(true);
+        
+        // We rely on SQL "ON DELETE CASCADE" to handle message cleanup atomically.
+        // This prevents race conditions and partial deletions.
+        const { error } = await supabase.from('users').delete().eq('id', userId);
+        
+        if (error) {
+            console.error(error);
+            if (error.code === '23503') {
+                alert('TERMINATION FAILED: Database constraint violation.\n\nPlease run the "ON DELETE CASCADE" SQL script in Supabase to enable automatic message cleanup.');
+            } else {
+                alert('TERMINATION FAILED: ' + error.message);
+            }
+        } else {
+            // Refresh data
+            await fetchData();
+        }
+        setLoading(false);
+    }
+  };
+
   const handleDeleteMessage = async (msgId: string) => {
     if (!supabase) return;
     if (confirm('Delete this message permanently?')) {
@@ -180,7 +204,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose }) => {
                               </div>
                               <div className="text-[10px] text-gray-500 mt-1 font-mono break-all">ID: {user.id}</div>
                             </div>
-                            <div className="flex gap-2 w-full md:w-auto">
+                            <div className="flex gap-2 w-full md:w-auto flex-wrap">
                               <NeonButton 
                                 variant="ghost" 
                                 className={`flex-1 md:flex-none text-xs justify-center ${user.can_send ? 'text-green-400' : 'text-red-400'}`}
@@ -194,6 +218,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onClose }) => {
                                 onClick={() => handleToggleRole(user.id, user.role)}
                               >
                                 {user.role === 'admin' ? 'DEMOTE' : 'PROMOTE'}
+                              </NeonButton>
+                              <NeonButton 
+                                variant="danger" 
+                                className="px-2 md:px-3 flex items-center justify-center"
+                                onClick={() => handleDeleteUser(user.id, user.username)}
+                                title="TERMINATE OPERATIVE"
+                              >
+                                <Trash2 className="w-4 h-4" />
                               </NeonButton>
                             </div>
                           </div>

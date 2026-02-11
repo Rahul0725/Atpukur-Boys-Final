@@ -36,6 +36,9 @@ export default function App() {
   const [showAdmin, setShowAdmin] = useState(false);
   const [showSidebarMobile, setShowSidebarMobile] = useState(true);
   
+  // Realtime Presence State
+  const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
+
   // Notification State
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   
@@ -121,40 +124,78 @@ export default function App() {
         remoteVideoRef.current.srcObject = remoteStreamRef.current;
         remoteVideoRef.current.play().catch(e => console.error("Error playing video:", e));
     }
-  }, [hasRemoteVideo, remoteStreamRef.current]); // Added remoteStreamRef.current dependency
+  }, [hasRemoteVideo, remoteStreamRef.current]);
 
   // --- Presence & User List Logic ---
   useEffect(() => {
     if (!currentUser || !supabase) return;
 
-    // Set online status
-    const updatePresence = async (status: boolean) => {
+    // 1. Database Persistence (for Last Seen & History)
+    // We still update the DB, but less frequently, just to keep "last_seen" roughly accurate.
+    const updateDbPresence = async (status: boolean) => {
       await supabase.from('users').update({ 
         is_online: status,
         last_seen: new Date().toISOString()
       }).eq('id', currentUser.id);
     };
 
-    updatePresence(true);
+    updateDbPresence(true);
+    // Relaxed heartbeat for DB (1 min)
+    const heartbeat = setInterval(() => updateDbPresence(true), 60000);
 
-    // Subscribe to User changes
+    // 2. Realtime Presence (Socket-based, Instant)
+    const presenceChannel = supabase.channel('room_presence', {
+      config: {
+        presence: {
+          key: currentUser.id, // Use User ID as the presence key
+        },
+      },
+    });
+
+    presenceChannel
+      .on('presence', { event: 'sync' }, () => {
+        const newState = presenceChannel.presenceState();
+        const ids = new Set<string>();
+        // Since we set key to currentUser.id, the keys of the state object are the user IDs
+        Object.keys(newState).forEach(key => ids.add(key));
+        setOnlineUserIds(ids);
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          await presenceChannel.track({
+            online_at: new Date().toISOString(),
+          });
+        }
+      });
+
+    // 3. User Data Subscription (New users, role changes, etc)
     const userSub = supabase
       .channel('public:users')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, () => {
-        fetchUsers();
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, (payload) => {
+        if (payload.eventType === 'DELETE' && payload.old && payload.old.id === currentUser.id) {
+            alert("CRITICAL ERROR: IDENTITY PURGED FROM SERVER.");
+            handleLogout();
+        } else {
+            fetchUsers();
+        }
       })
       .subscribe();
 
     // Initial Fetch
     fetchUsers();
 
-    // Heartbeat
-    const heartbeat = setInterval(() => updatePresence(true), 30000);
+    // Handle Unload
+    const handleUnload = () => {
+       updateDbPresence(false);
+    };
+    window.addEventListener('beforeunload', handleUnload);
 
     return () => {
-      updatePresence(false);
-      supabase.removeChannel(userSub);
+      updateDbPresence(false);
       clearInterval(heartbeat);
+      window.removeEventListener('beforeunload', handleUnload);
+      supabase.removeChannel(userSub);
+      supabase.removeChannel(presenceChannel);
     };
   }, [currentUser]);
 
@@ -325,8 +366,6 @@ export default function App() {
     pc.ontrack = (event) => {
       console.log("Track received:", event.track.kind, event.streams);
       
-      // If we receive a track, use the stream provided by the event or create one
-      // Important: Use existing ref if the stream ID matches to avoid thrashing
       let stream = event.streams[0];
       if (!stream) {
           stream = new MediaStream();
@@ -339,7 +378,6 @@ export default function App() {
          console.log("Video track detected via ontrack");
          setHasRemoteVideo(true);
          
-         // Force re-attach for video element
          if (remoteVideoRef.current) {
              remoteVideoRef.current.srcObject = stream;
              remoteVideoRef.current.play().catch(console.error);
@@ -350,7 +388,6 @@ export default function App() {
              setHasRemoteVideo(false);
          };
       } else if (event.track.kind === 'audio') {
-          // If we have video, the video element plays the audio too if it's the same stream
           if (remoteAudioRef.current) {
             remoteAudioRef.current.srcObject = stream;
             remoteAudioRef.current.play().catch(e => console.error("Error playing audio:", e));
@@ -358,7 +395,6 @@ export default function App() {
       }
     };
 
-    // Add local tracks if they exist
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => {
         pc.addTrack(track, localStreamRef.current!);
@@ -406,7 +442,6 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStreamRef.current = stream;
 
-      // Add local tracks to the existing PC (created when offer arrived)
       stream.getTracks().forEach(track => {
         if (peerConnectionRef.current) {
           peerConnectionRef.current.addTrack(track, stream);
@@ -440,7 +475,6 @@ export default function App() {
     console.log("Stopping screen share");
     const pc = peerConnectionRef.current;
     
-    // Find and remove the video sender
     const senders = pc.getSenders();
     const videoSender = senders.find(s => s.track?.kind === 'video');
     
@@ -448,7 +482,6 @@ export default function App() {
         pc.removeTrack(videoSender);
     }
 
-    // Stop the local track
     if (localStreamRef.current) {
         const videoTracks = localStreamRef.current.getVideoTracks();
         videoTracks.forEach(t => {
@@ -459,7 +492,6 @@ export default function App() {
 
     setIsScreenSharing(false);
 
-    // Negotiate removal
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -495,20 +527,16 @@ export default function App() {
              stopScreenShare();
         };
 
-        // Add to local stream for consistency, though not strictly required for sending
         if (localStreamRef.current) {
             localStreamRef.current.addTrack(screenTrack);
-            // Add track to PC. Use localStreamRef to ensure stream ID matches if possible
             pc.addTrack(screenTrack, localStreamRef.current);
         } else {
-            // Fallback if no audio call existed (unlikely in this flow)
             pc.addTrack(screenTrack, screenStream);
         }
 
         setIsScreenSharing(true);
         console.log("Screen track added, creating offer...");
 
-        // Create Offer for renegotiation
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         
@@ -607,7 +635,7 @@ export default function App() {
 
   const fetchUsers = async () => {
     if (!supabase) return;
-    const { data } = await supabase.from('users').select('*').order('is_online', { ascending: false });
+    const { data } = await supabase.from('users').select('*').order('created_at', { ascending: false });
     if (data) setUsers(data as User[]);
   };
 
@@ -676,6 +704,7 @@ export default function App() {
     setMessages([]);
     setUnreadCounts({});
     setLoginError(null);
+    setOnlineUserIds(new Set());
   };
 
   const sendMessage = async (e: React.FormEvent) => {
@@ -693,7 +722,18 @@ export default function App() {
     if (error) { console.error(error); alert("Failed to send message."); } else { setInputText(''); }
   };
 
-  const getInitials = (name: string) => name.substring(0, 2).toUpperCase();
+  // --- Avatar Helper ---
+  const getAvatarEmoji = (username: string) => {
+    if (!username) return '👤';
+    if (username === 'PUBLIC_NET') return '🌐';
+    if (username.toLowerCase() === 'habib') return '👑';
+    const emojis = ['👾', '🤖', '👽', '💀', '👻', '👺', '🤡', '☠️', '💻', '💾', '💿', '📼', '🕹️', '🔮', '🧬', '🦠', '🔋', '📡', '🔭', '🧱'];
+    let hash = 0;
+    for (let i = 0; i < username.length; i++) {
+        hash = username.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return emojis[Math.abs(hash) % emojis.length];
+  };
 
   // Helper Component for Call Buttons
   const CallControlButton = ({ active, onClick, icon: Icon, label, variant = 'normal' }: any) => (
@@ -719,6 +759,18 @@ export default function App() {
       </span>
     </button>
   );
+
+  // --- Helpers for Display ---
+  // Sort users so connected (green dot) users are always first
+  const sortedUsers = [...users.filter(u => u.id !== currentUser.id)].sort((a, b) => {
+    const aOnline = onlineUserIds.has(a.id);
+    const bOnline = onlineUserIds.has(b.id);
+    if (aOnline && !bOnline) return -1;
+    if (!aOnline && bOnline) return 1;
+    return 0;
+  });
+
+  const getIsUserOnline = (userId: string) => onlineUserIds.has(userId);
 
   // --- Render ---
 
@@ -915,10 +967,8 @@ export default function App() {
 
                    {/* Avatar Hexagon/Circle */}
                    <div className="mb-8 relative group">
-                      <div className="w-40 h-40 rounded-full bg-black border border-white/10 flex items-center justify-center relative overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] z-10">
-                         <span className="font-mono text-5xl text-white font-bold">
-                            {getInitials((incomingCallUser?.username || activeUser?.username || "?"))}
-                         </span>
+                      <div className="w-40 h-40 rounded-full bg-black border border-white/10 flex items-center justify-center relative overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] z-10 text-6xl">
+                         {getAvatarEmoji((incomingCallUser?.username || activeUser?.username || ""))}
                       </div>
                       
                       {/* Orbital Rings */}
@@ -1005,8 +1055,8 @@ export default function App() {
         {/* User Profile Header */}
         <div className="p-4 border-b border-white/10 flex justify-between items-center bg-white/5">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-gray-900 to-black border border-white/20 flex items-center justify-center shadow-lg">
-               <span className="font-mono font-bold text-white text-lg">{getInitials(currentUser.username)}</span>
+            <div className="w-10 h-10 rounded-sm bg-gradient-to-br from-gray-900 to-black border border-white/20 flex items-center justify-center shadow-lg text-lg">
+               {getAvatarEmoji(currentUser.username)}
             </div>
             <div>
               <div className="font-mono font-bold text-white text-sm">{currentUser.username}</div>
@@ -1033,21 +1083,21 @@ export default function App() {
              <div 
                onClick={() => { setActiveUser(GROUP_CHAT_USER); setShowSidebarMobile(false); }}
                className={`
-                 relative group p-3 rounded-xl cursor-pointer transition-all duration-300 border overflow-hidden
+                 relative group p-3 rounded-sm cursor-pointer transition-all duration-300 border overflow-hidden
                  ${activeUser?.id === GROUP_CHAT_ID 
-                    ? 'bg-neon-purple/10 border-neon-purple/40 shadow-[0_0_15px_rgba(188,19,254,0.15)]' 
+                    ? 'bg-neon-purple/10 border-neon-purple/40 border-l-2 border-l-neon-purple' 
                     : 'bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/10'}
                `}
              >
                <div className="flex items-center gap-3 relative z-10">
-                  <div className={`p-2 rounded-lg transition-colors ${activeUser?.id === GROUP_CHAT_ID ? 'bg-neon-purple text-black' : 'bg-black/40 text-gray-400'}`}>
-                    <Users className="w-5 h-5" />
+                  <div className={`p-2 rounded-sm transition-colors text-lg`}>
+                     🌐
                   </div>
                   <div className="flex-1 min-w-0">
                       <div className="flex justify-between items-center">
                         <div className={`font-mono text-sm font-bold truncate ${activeUser?.id === GROUP_CHAT_ID ? 'text-white' : 'text-gray-300'}`}>PUBLIC_NET</div>
                         {unreadCounts[GROUP_CHAT_ID] ? (
-                          <div className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-md shadow-[0_0_10px_rgba(239,68,68,0.8)] animate-pulse border border-red-400">
+                          <div className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-sm shadow-[0_0_10px_rgba(239,68,68,0.8)] animate-pulse border border-red-400">
                             {unreadCounts[GROUP_CHAT_ID]}
                           </div>
                         ) : null}
@@ -1055,7 +1105,6 @@ export default function App() {
                       <div className="text-[10px] text-gray-500 truncate mt-0.5">Broadcast Channel</div>
                   </div>
                </div>
-               {activeUser?.id === GROUP_CHAT_ID && <div className="absolute left-0 top-0 bottom-0 w-1 bg-neon-purple"></div>}
              </div>
           </div>
 
@@ -1064,23 +1113,23 @@ export default function App() {
             <span className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">Private Uplinks</span>
           </div>
           
-          {users.filter(u => u.id !== currentUser.id).map(user => (
+          {sortedUsers.map(user => (
             <div 
               key={user.id}
               onClick={() => { setActiveUser(user); setShowSidebarMobile(false); }}
               className={`
-                relative group p-3 rounded-xl cursor-pointer transition-all duration-300 border mb-2
+                relative group p-3 rounded-sm cursor-pointer transition-all duration-300 border mb-2
                 ${activeUser?.id === user.id 
-                   ? 'bg-white/10 border-white/20' 
+                   ? 'bg-white/10 border-white/20 border-l-2 border-l-white' 
                    : 'bg-transparent border-transparent hover:bg-white/5'}
               `}
             >
               <div className="flex items-center gap-3 relative z-10">
                 <div className="relative">
-                  <div className="w-10 h-10 rounded-lg bg-black/60 border border-white/10 flex items-center justify-center text-gray-400 font-mono text-sm shadow-inner">
-                    {getInitials(user.username)}
+                  <div className="w-10 h-10 rounded-sm bg-black/60 border border-white/10 flex items-center justify-center text-lg shadow-inner">
+                     {getAvatarEmoji(user.username)}
                   </div>
-                  <div className={`absolute -bottom-1 -right-1 w-3 h-3 rounded-full border-2 border-black ${user.is_online ? 'bg-neon-green shadow-[0_0_5px_rgba(0,255,65,0.8)]' : 'bg-gray-600'}`} />
+                  <div className={`absolute -bottom-1 -right-1 w-2.5 h-2.5 rounded-full border-2 border-black ${getIsUserOnline(user.id) ? 'bg-neon-green shadow-[0_0_5px_rgba(0,255,65,0.8)]' : 'bg-gray-600'}`} />
                 </div>
                 
                 <div className="flex-1 min-w-0">
@@ -1094,17 +1143,16 @@ export default function App() {
                         {unreadCounts[user.id]}
                       </div>
                     ) : (
-                      user.role === 'admin' && <span className="text-[8px] border border-neon-purple/40 text-neon-purple px-1 rounded">ADMIN</span>
+                      user.role === 'admin' && <span className="text-[8px] border border-neon-purple/40 text-neon-purple px-1 rounded-sm">ADMIN</span>
                     )}
                   </div>
                   <div className="flex items-center gap-1 mt-0.5">
                      <span className="text-[10px] text-gray-500 font-mono truncate">
-                       {user.is_online ? 'ACTIVE NOW' : `SEEN: ${new Date(user.last_seen).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`}
+                       {getIsUserOnline(user.id) ? 'ACTIVE NOW' : `SEEN: ${new Date(user.last_seen).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`}
                      </span>
                   </div>
                 </div>
               </div>
-              {activeUser?.id === user.id && <div className="absolute left-0 top-0 bottom-0 w-1 bg-white"></div>}
             </div>
           ))}
         </div>
@@ -1114,14 +1162,14 @@ export default function App() {
            {currentUser.role === 'admin' ? (
              <NeonButton 
                variant="primary" 
-               className="w-full flex items-center justify-center gap-2"
+               className="w-full flex items-center justify-center gap-2 rounded-sm"
                onClick={() => setShowAdmin(true)}
              >
                <Shield className="w-4 h-4" />
                ADMIN_PANEL
              </NeonButton>
            ) : (
-             <div className="w-full p-2 rounded border border-white/5 bg-white/5 flex items-center justify-center gap-2">
+             <div className="w-full p-2 rounded-sm border border-white/5 bg-white/5 flex items-center justify-center gap-2">
                <Lock className="w-3 h-3 text-gray-500" />
                <span className="text-[10px] font-mono text-gray-500 tracking-widest uppercase">
                  ENCRYPTED v2.0
@@ -1148,8 +1196,8 @@ export default function App() {
                   <ChevronLeft className="w-6 h-6" />
                 </button>
                 <div className="flex items-center gap-3">
-                  <div className={`w-9 h-9 rounded-lg flex items-center justify-center shadow-lg ${activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple/20 text-neon-purple' : 'bg-white/10 text-white'}`}>
-                      {activeUser.id === GROUP_CHAT_ID ? <Globe className="w-5 h-5" /> : <span className="font-mono font-bold">{getInitials(activeUser.username)}</span>}
+                  <div className={`w-9 h-9 rounded-sm flex items-center justify-center shadow-lg text-lg ${activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple/20 text-neon-purple' : 'bg-white/10 text-white'}`}>
+                      {getAvatarEmoji(activeUser.username)}
                   </div>
                   <div>
                     <div className="font-mono font-bold text-white flex items-center gap-2 text-sm md:text-base">
@@ -1157,8 +1205,13 @@ export default function App() {
                       {activeUser.role === 'admin' && activeUser.id !== GROUP_CHAT_ID && <Badge status="admin" />}
                     </div>
                     <div className={`text-[10px] font-mono tracking-widest uppercase flex items-center gap-1.5 ${activeUser.id === GROUP_CHAT_ID ? 'text-neon-purple' : 'text-neon-blue'}`}>
-                       {activeUser.is_online ? <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple' : 'bg-neon-blue'}`}></span> : <Clock className="w-3 h-3"/>}
-                       {activeUser.id === GROUP_CHAT_ID ? 'BROADCAST FREQUENCY' : (activeUser.is_online ? 'SECURE CONNECTION' : 'OFFLINE')}
+                       {activeUser.id === GROUP_CHAT_ID 
+                          ? 'BROADCAST FREQUENCY' 
+                          : (getIsUserOnline(activeUser.id) 
+                              ? <span className="flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-neon-green animate-pulse"></span> SECURE CONNECTION</span> 
+                              : <span className="flex items-center gap-1.5"><Clock className="w-3 h-3"/> OFFLINE</span>
+                            )
+                       }
                     </div>
                   </div>
                 </div>
@@ -1168,7 +1221,7 @@ export default function App() {
               {activeUser.id !== GROUP_CHAT_ID && currentUser.can_send && (
                 <button 
                   onClick={startCall}
-                  className="p-2 text-neon-green bg-neon-green/10 border border-neon-green/30 rounded-lg hover:bg-neon-green hover:text-black transition-all hover:shadow-[0_0_10px_rgba(0,255,65,0.4)]"
+                  className="p-2 text-neon-green bg-neon-green/10 border border-neon-green/30 rounded-sm hover:bg-neon-green hover:text-black transition-all hover:shadow-[0_0_10px_rgba(0,255,65,0.4)]"
                   title="Initiate Encrypted Voice Uplink"
                 >
                   <Phone className="w-5 h-5" />
@@ -1177,7 +1230,7 @@ export default function App() {
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 scroll-smooth bg-black/40">
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 scroll-smooth bg-black/40">
                {messages.length === 0 && (
                  <div className="h-full flex flex-col items-center justify-center opacity-30 select-none">
                     <div className="w-24 h-24 border border-dashed border-white/20 rounded-full animate-[spin_10s_linear_infinite] mb-6 flex items-center justify-center">
@@ -1198,32 +1251,36 @@ export default function App() {
                      
                      <div className={`flex items-end gap-3 max-w-[85%] md:max-w-[70%] ${isMe ? 'flex-row-reverse' : 'flex-row'}`}>
                         
-                        {/* Avatar */}
+                        {/* Avatar for others */}
                         {!isMe && (
-                          <div className="w-8 h-8 rounded-lg bg-black/60 border border-white/10 flex-shrink-0 flex items-center justify-center text-[10px] font-mono font-bold text-gray-400 mb-1 shadow-lg">
-                             {getInitials(msg.username)}
+                          <div className="w-8 h-8 rounded-sm bg-black/60 border border-white/10 flex-shrink-0 flex items-center justify-center text-sm shadow-lg">
+                             {getAvatarEmoji(msg.username)}
                           </div>
                         )}
 
                         <div className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
-                           {/* Sender Name in Group */}
-                           {isGroup && !isMe && showHeader && (
-                             <span className="text-[10px] font-mono font-bold text-neon-purple mb-1 ml-1">{msg.username}</span>
-                           )}
-
-                           {/* The Bubble */}
+                           {/* The Squared Data Bubble */}
                            <div className={`
-                             relative px-5 py-3 text-sm leading-relaxed shadow-lg
+                             relative px-4 py-3 text-sm leading-relaxed shadow-lg min-w-[140px]
                              ${isMe 
-                               ? 'bg-neon-green/5 text-neon-green border border-neon-green/30 rounded-2xl rounded-tr-sm shadow-[0_0_15px_rgba(0,255,65,0.05)]' 
-                               : 'bg-[#121212] text-gray-200 border border-white/10 rounded-2xl rounded-tl-sm backdrop-blur-sm'}
+                               ? 'bg-neon-green/10 text-neon-green border-t border-b border-l border-neon-green/30 border-r-2 border-r-neon-green rounded-sm' 
+                               : 'bg-white/5 text-gray-200 border-t border-b border-r border-white/10 border-l-2 border-l-white/40 rounded-sm'}
                            `}>
+                             {/* Sender Name Inside Bubble */}
+                             {isGroup && !isMe && showHeader && (
+                               <div className="text-[10px] font-mono font-bold text-neon-purple mb-1.5 pb-1 border-b border-white/10 block w-full">
+                                 {msg.username}
+                               </div>
+                             )}
+
                              {msg.message}
                              
-                             {/* Timestamp */}
-                             <div className={`text-[9px] font-mono mt-2 flex items-center gap-1 opacity-50 ${isMe ? 'justify-end text-neon-green' : 'text-gray-500'}`}>
-                                {new Date(msg.created_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
-                                {isMe && <Check className="w-3 h-3" />}
+                             {/* Metadata Footer */}
+                             <div className={`flex items-center gap-2 mt-2 pt-2 border-t ${isMe ? 'border-neon-green/20' : 'border-white/5'}`}>
+                                <span className={`text-[9px] font-mono uppercase tracking-wider opacity-60 ${isMe ? 'text-neon-green' : 'text-gray-500'}`}>
+                                   TS: {new Date(msg.created_at).toLocaleTimeString([], {hour12: false, hour: '2-digit', minute:'2-digit'})}
+                                </span>
+                                {isMe && <Check className="w-3 h-3 opacity-60" />}
                              </div>
                            </div>
                         </div>
@@ -1236,23 +1293,26 @@ export default function App() {
 
             {/* Input */}
             <div className="p-4 md:p-6 border-t border-white/10 bg-black/80 backdrop-blur-xl z-20">
-              <form onSubmit={sendMessage} className="flex gap-4 relative max-w-4xl mx-auto w-full">
+              <form onSubmit={sendMessage} className="flex gap-4 relative max-w-4xl mx-auto w-full items-end">
                  <div className="relative flex-1 group">
-                    <div className={`absolute -inset-0.5 rounded-lg blur opacity-20 transition duration-500 group-hover:opacity-40 ${activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple' : 'bg-neon-green'}`}></div>
+                    <div className={`absolute -inset-0.5 rounded-sm blur opacity-20 transition duration-500 group-hover:opacity-40 ${activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple' : 'bg-neon-green'}`}></div>
                     <Input 
                         value={inputText}
                         onChange={(e) => setInputText(e.target.value)}
                         placeholder={currentUser.can_send ? (activeUser.id === GROUP_CHAT_ID ? "Broadcast to public net..." : "Encrypted message...") : "ACCESS RESTRICTED"}
                         disabled={!currentUser.can_send}
-                        className="bg-black relative pr-12 text-sm"
+                        className="bg-black relative pr-12 text-sm rounded-sm border-white/10 focus:border-neon-green/50"
                     />
+                    {inputText && (
+                       <div className="absolute right-3 top-1/2 -translate-y-1/2 w-2 h-4 bg-neon-green/50 animate-pulse"></div>
+                    )}
                  </div>
                  <button 
                    type="submit" 
                    disabled={!inputText.trim() || !currentUser.can_send}
                    className={`
-                      p-3 rounded-lg flex items-center justify-center transition-all duration-300
-                      ${!inputText.trim() ? 'bg-white/5 text-gray-600' : (activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple/20 text-neon-purple border border-neon-purple/50 shadow-[0_0_15px_rgba(188,19,254,0.3)] hover:bg-neon-purple hover:text-white' : 'bg-neon-green/20 text-neon-green border border-neon-green/50 shadow-[0_0_15px_rgba(0,255,65,0.3)] hover:bg-neon-green hover:text-black')}
+                      p-3 rounded-sm flex items-center justify-center transition-all duration-300 h-[46px] w-[46px]
+                      ${!inputText.trim() ? 'bg-white/5 text-gray-600 border border-white/5' : (activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple/20 text-neon-purple border border-neon-purple/50 shadow-[0_0_15px_rgba(188,19,254,0.3)] hover:bg-neon-purple hover:text-white' : 'bg-neon-green/20 text-neon-green border border-neon-green/50 shadow-[0_0_15px_rgba(0,255,65,0.3)] hover:bg-neon-green hover:text-black')}
                    `}
                  >
                    <Send className="w-5 h-5" />
