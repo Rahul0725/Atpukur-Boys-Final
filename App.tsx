@@ -142,6 +142,11 @@ export default function App() {
              setIsRestoringSession(false);
              return;
           }
+          if (insertError.message?.includes('avatar_url') || insertError.message?.includes('column')) {
+             setLoginError("Database Schema Mismatch: Missing 'avatar_url' column. Please run the SQL migration.");
+             setIsRestoringSession(false);
+             return;
+          }
           throw insertError;
         }
         setCurrentUser(newUser);
@@ -841,7 +846,11 @@ export default function App() {
                       // handleFirebaseUser is called by onAuthStateChanged listener
                     } catch (err: any) {
                       console.error("Login Error:", err);
-                      setLoginError(err.message || "UPLINK FAILED");
+                      if (err.code === 'auth/unauthorized-domain') {
+                        setLoginError(`DOMAIN NOT AUTHORIZED: Go to Firebase Console > Authentication > Settings > Authorized Domains and add: ${window.location.hostname}`);
+                      } else {
+                        setLoginError(err.message || "UPLINK FAILED");
+                      }
                     }
                   }}
                   className="w-full bg-white text-black py-4 rounded-lg font-mono font-bold tracking-widest uppercase hover:bg-gray-200 transition-all duration-300 shadow-[0_0_20px_rgba(255,255,255,0.2)] relative overflow-hidden group/btn flex items-center justify-center gap-3"
