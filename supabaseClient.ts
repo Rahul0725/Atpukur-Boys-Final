@@ -24,14 +24,43 @@ export const checkSupabaseConfig = () => {
  * 
  * -- 2. Create Users Table
  * create table if not exists users (
- *   id uuid default gen_random_uuid() primary key,
+ *   id uuid references auth.users on delete cascade primary key,
  *   username text unique not null,
+ *   full_name text,
+ *   avatar_url text,
  *   role text default 'user',
  *   can_send boolean default true,
  *   is_online boolean default false,
  *   last_seen timestamptz default now(),
  *   created_at timestamptz default now()
  * );
+ * 
+ * -- 2.1 Trigger to create user on signup
+ * create or replace function public.handle_new_user()
+ * returns trigger as $$
+ * begin
+ *   insert into public.users (id, username, full_name, avatar_url)
+ *   values (
+ *     new.id,
+ *     coalesce(new.raw_user_meta_data->>'user_name', split_part(new.email, '@', 1)),
+ *     new.raw_user_meta_data->>'full_name',
+ *     new.raw_user_meta_data->>'avatar_url'
+ *   );
+ *   return new;
+ * end;
+ * $$ language plpgsql security definer;
+ * 
+ * drop trigger if exists on_auth_user_created on auth.users;
+ * create trigger on_auth_user_created
+ *   after insert on auth.users
+ *   for each row execute procedure public.handle_new_user();
+ * 
+ * -- 2.2 Update existing users table if it already exists
+ * -- alter table users add column if not exists full_name text;
+ * -- alter table users add column if not exists avatar_url text;
+ * -- alter table users drop constraint if exists users_pkey cascade;
+ * -- alter table users add primary key (id);
+ * -- alter table users add constraint users_id_fkey foreign key (id) references auth.users(id) on delete cascade;
  * 
  * -- 3. Create Messages Table (WITH CASCADE DELETE FOR USER MANAGEMENT)
  * create table if not exists messages (
