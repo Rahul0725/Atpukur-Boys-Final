@@ -6,6 +6,9 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { UserProfileDashboard } from './components/UserProfileDashboard';
 import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Terminal, Cpu, User as UserIcon } from 'lucide-react';
 
+import { auth, googleProvider, signInWithPopup, signOut, FirebaseUser } from './src/firebaseConfig';
+import { onAuthStateChanged } from 'firebase/auth';
+
 // Constant for the Group Chat "User" placeholder
 const GROUP_CHAT_ID = 'global_public_channel';
 const GROUP_CHAT_USER: User = {
@@ -76,62 +79,80 @@ export default function App() {
   useEffect(() => {
     setIsConfigured(checkSupabaseConfig());
     
-    // Attempt to restore session from Supabase Auth
-    const restoreSession = async () => {
-      if (supabase) {
-        try {
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user) {
-            const { data, error } = await supabase.from('users').select('*').eq('id', session.user.id).single();
-            if (data && !error) {
-              setCurrentUser(data as User);
-              await supabase.from('users').update({ is_online: true }).eq('id', session.user.id);
-            } else if (error && error.code === 'PGRST116') {
-              // User in auth but not in public.users yet (trigger might be delayed)
-              // We'll wait for the trigger or insert manually if needed
-              // For now, let's just retry after a short delay
-              setTimeout(async () => {
-                const { data: retryData } = await supabase.from('users').select('*').eq('id', session.user.id).single();
-                if (retryData) {
-                  setCurrentUser(retryData as User);
-                  await supabase.from('users').update({ is_online: true }).eq('id', session.user.id);
-                }
-              }, 1000);
-            }
-          }
-        } catch (e) {
-          console.error("Session restore failed", e);
-        }
-      }
-      setIsRestoringSession(false);
-    };
-    
-    restoreSession();
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (event === 'SIGNED_IN' && session?.user) {
-        const { data } = await supabase.from('users').select('*').eq('id', session.user.id).single();
-        if (data) {
-          setCurrentUser(data as User);
-          await supabase.from('users').update({ is_online: true }).eq('id', session.user.id);
+    // Listen for Firebase Auth State Changes
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        await handleFirebaseUser(firebaseUser);
+      } else {
+        // Check for dev bypass user
+        const devUserId = localStorage.getItem('atpukur_user_id');
+        if (devUserId && devUserId.startsWith('dev-user-')) {
+           // Keep dev user session if active
+           setIsRestoringSession(false);
         } else {
-           setTimeout(async () => {
-              const { data: retryData } = await supabase.from('users').select('*').eq('id', session.user.id).single();
-              if (retryData) {
-                setCurrentUser(retryData as User);
-                await supabase.from('users').update({ is_online: true }).eq('id', session.user.id);
-              }
-            }, 1000);
+           setCurrentUser(null);
+           setIsRestoringSession(false);
         }
-      } else if (event === 'SIGNED_OUT') {
-        setCurrentUser(null);
       }
     });
 
-    return () => {
-      subscription.unsubscribe();
-    };
+    return () => unsubscribe();
   }, []);
+
+  const handleFirebaseUser = async (firebaseUser: FirebaseUser) => {
+    if (!supabase) return;
+    setIsRestoringSession(true);
+    try {
+      // Check if user exists in Supabase public.users table
+      const { data: existingUser, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', firebaseUser.uid) // Use Firebase UID as ID
+        .single();
+
+      if (existingUser) {
+        setCurrentUser(existingUser as User);
+        await supabase.from('users').update({ is_online: true }).eq('id', firebaseUser.uid);
+      } else {
+        // Create new user record
+        const newUser: User = {
+          id: firebaseUser.uid,
+          username: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Anonymous',
+          full_name: firebaseUser.displayName || '',
+          avatar_url: firebaseUser.photoURL || '',
+          role: 'user',
+          can_send: true,
+          is_online: true,
+          last_seen: new Date().toISOString(),
+          created_at: new Date().toISOString()
+        };
+
+        const { error: insertError } = await supabase.from('users').insert([newUser]);
+        
+        if (insertError) {
+          console.error("Error creating user record:", insertError);
+          // If error is foreign key violation, it means Supabase Auth constraint is still active
+          if (insertError.code === '23503') { // foreign_key_violation
+             setLoginError("Database Schema Mismatch: Please run the SQL migration to allow Firebase UIDs.");
+             setIsRestoringSession(false);
+             return;
+          }
+          if (insertError.code === '22P02') { // invalid text representation (UUID vs String)
+             setLoginError("Database Schema Mismatch: ID column must be TEXT, not UUID.");
+             setIsRestoringSession(false);
+             return;
+          }
+          throw insertError;
+        }
+        setCurrentUser(newUser);
+      }
+    } catch (err: any) {
+      console.error("Error handling Firebase user:", err);
+      setLoginError(err.message);
+    } finally {
+      setIsRestoringSession(false);
+    }
+  };
 
   // Update Refs when state changes
   useEffect(() => {
@@ -814,16 +835,10 @@ export default function App() {
               <div className="space-y-6">
                 <button 
                   onClick={async () => {
-                    if (!supabase) return;
                     setLoginError(null);
                     try {
-                      const { error } = await supabase.auth.signInWithOAuth({
-                        provider: 'google',
-                        options: {
-                          redirectTo: `${window.location.origin}/`
-                        }
-                      });
-                      if (error) throw error;
+                      const result = await signInWithPopup(auth, googleProvider);
+                      // handleFirebaseUser is called by onAuthStateChanged listener
                     } catch (err: any) {
                       console.error("Login Error:", err);
                       setLoginError(err.message || "UPLINK FAILED");
@@ -838,9 +853,34 @@ export default function App() {
                     <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
                   </svg>
                   <span className="relative z-10">
-                    Authenticate via Google
+                    Authenticate via Google (Firebase)
                   </span>
                 </button>
+                <p className="text-[10px] text-center text-gray-500 font-mono">
+                  * Uses Firebase Auth linked to Supabase DB
+                </p>
+                
+                <div className="pt-4 border-t border-white/10">
+                  <button
+                    onClick={() => {
+                      const devUser: User = {
+                        id: 'dev-user-' + Math.random().toString(36).substr(2, 9),
+                        username: 'DEV_OPERATOR',
+                        role: 'admin',
+                        can_send: true,
+                        is_online: true,
+                        last_seen: new Date().toISOString(),
+                        created_at: new Date().toISOString()
+                      };
+                      setCurrentUser(devUser);
+                      localStorage.setItem('atpukur_user_id', devUser.id);
+                    }}
+                    className="w-full py-2 text-[10px] text-gray-600 hover:text-white font-mono uppercase tracking-widest transition-colors flex items-center justify-center gap-2 group"
+                  >
+                    <Terminal className="w-3 h-3 group-hover:text-neon-green" />
+                    <span>Bypass Auth (Dev Mode)</span>
+                  </button>
+                </div>
               </div>
 
               <div className="mt-6 text-center">

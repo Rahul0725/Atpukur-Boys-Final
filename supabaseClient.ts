@@ -1,8 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 
 // Configuration for Project: rdwbzeepcsfhlaemvvfe
-const SUPABASE_URL = 'https://rdwbzeepcsfhlaemvvfe.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJkd2J6ZWVwY3NmaGxhZW12dmZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTU0NDMsImV4cCI6MjA4NjA5MTQ0M30.frVSkg3o9oFgfrFRrRM6QDfQBvqF-e3zow6QVifejmE';
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://rdwbzeepcsfhlaemvvfe.supabase.co';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJkd2J6ZWVwY3NmaGxhZW12dmZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTU0NDMsImV4cCI6MjA4NjA5MTQ0M30.frVSkg3o9oFgfrFRrRM6QDfQBvqF-e3zow6QVifejmE';
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -61,6 +61,17 @@ export const checkSupabaseConfig = () => {
  * -- alter table users drop constraint if exists users_pkey cascade;
  * -- alter table users add primary key (id);
  * -- alter table users add constraint users_id_fkey foreign key (id) references auth.users(id) on delete cascade;
+ * 
+ * -- 2.3 FIREBASE MIGRATION (REQUIRED FOR FIREBASE AUTH)
+ * -- If you are switching to Firebase Auth, you must remove the foreign key constraint to auth.users
+ * -- and allow the ID column to accept Firebase UIDs (strings).
+ * 
+ * -- alter table messages drop constraint if exists messages_sender_id_fkey;
+ * -- alter table messages drop constraint if exists messages_receiver_id_fkey;
+ * -- alter table users drop constraint if exists users_id_fkey;
+ * -- alter table users alter column id type text; 
+ * -- alter table messages alter column sender_id type text;
+ * -- alter table messages alter column receiver_id type text;
  * 
  * -- 3. Create Messages Table (WITH CASCADE DELETE FOR USER MANAGEMENT)
  * create table if not exists messages (
