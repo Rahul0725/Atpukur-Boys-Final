@@ -1,13 +1,9 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { supabase, checkSupabaseConfig } from './supabaseClient';
 import { User, Message } from './types';
-import { GlassCard, NeonButton, Input, Badge, UserAvatar, getAvatarEmoji } from './components/Layout';
+import { GlassCard, NeonButton, Input, Badge } from './components/Layout';
 import { AdminDashboard } from './components/AdminDashboard';
-import { UserProfileDashboard } from './components/UserProfileDashboard';
-import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Terminal, Cpu, User as UserIcon } from 'lucide-react';
-
-import { auth, googleProvider, signInWithPopup, signOut, FirebaseUser } from './src/firebaseConfig';
-import { onAuthStateChanged } from 'firebase/auth';
+import { Send, LogOut, ChevronLeft, Shield, Clock, AlertTriangle, Lock, Globe, Users, Check, Bell, Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Terminal, Cpu } from 'lucide-react';
 
 // Constant for the Group Chat "User" placeholder
 const GROUP_CHAT_ID = 'global_public_channel';
@@ -38,7 +34,6 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [showAdmin, setShowAdmin] = useState(false);
-  const [showProfile, setShowProfile] = useState(false);
   const [showSidebarMobile, setShowSidebarMobile] = useState(true);
   
   // Realtime Presence State
@@ -79,85 +74,27 @@ export default function App() {
   useEffect(() => {
     setIsConfigured(checkSupabaseConfig());
     
-    // Listen for Firebase Auth State Changes
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        await handleFirebaseUser(firebaseUser);
-      } else {
-        // Check for dev bypass user
-        const devUserId = localStorage.getItem('atpukur_user_id');
-        if (devUserId && devUserId.startsWith('dev-user-')) {
-           // Keep dev user session if active
-           setIsRestoringSession(false);
-        } else {
-           setCurrentUser(null);
-           setIsRestoringSession(false);
+    // Attempt to restore session from localStorage
+    const restoreSession = async () => {
+      const savedId = localStorage.getItem('atpukur_user_id');
+      if (savedId && supabase) {
+        try {
+          const { data, error } = await supabase.from('users').select('*').eq('id', savedId).single();
+          if (data && !error) {
+            setCurrentUser(data as User);
+            // Optionally update online status immediately
+            await supabase.from('users').update({ is_online: true }).eq('id', savedId);
+          }
+        } catch (e) {
+          console.error("Session restore failed", e);
+          localStorage.removeItem('atpukur_user_id');
         }
       }
-    });
-
-    return () => unsubscribe();
-  }, []);
-
-  const handleFirebaseUser = async (firebaseUser: FirebaseUser) => {
-    if (!supabase) return;
-    setIsRestoringSession(true);
-    try {
-      // Check if user exists in Supabase public.users table
-      const { data: existingUser, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', firebaseUser.uid) // Use Firebase UID as ID
-        .single();
-
-      if (existingUser) {
-        setCurrentUser(existingUser as User);
-        await supabase.from('users').update({ is_online: true }).eq('id', firebaseUser.uid);
-      } else {
-        // Create new user record
-        const newUser: User = {
-          id: firebaseUser.uid,
-          username: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Anonymous',
-          full_name: firebaseUser.displayName || '',
-          avatar_url: firebaseUser.photoURL || '',
-          role: 'user',
-          can_send: true,
-          is_online: true,
-          last_seen: new Date().toISOString(),
-          created_at: new Date().toISOString()
-        };
-
-        const { error: insertError } = await supabase.from('users').insert([newUser]);
-        
-        if (insertError) {
-          console.error("Error creating user record:", insertError);
-          // If error is foreign key violation, it means Supabase Auth constraint is still active
-          if (insertError.code === '23503') { // foreign_key_violation
-             setLoginError("Database Schema Mismatch: Please run the SQL migration to allow Firebase UIDs.");
-             setIsRestoringSession(false);
-             return;
-          }
-          if (insertError.code === '22P02') { // invalid text representation (UUID vs String)
-             setLoginError("Database Schema Mismatch: ID column must be TEXT, not UUID.");
-             setIsRestoringSession(false);
-             return;
-          }
-          if (insertError.message?.includes('avatar_url') || insertError.message?.includes('column')) {
-             setLoginError("Database Schema Mismatch: Missing 'avatar_url' column. Please run the SQL migration.");
-             setIsRestoringSession(false);
-             return;
-          }
-          throw insertError;
-        }
-        setCurrentUser(newUser);
-      }
-    } catch (err: any) {
-      console.error("Error handling Firebase user:", err);
-      setLoginError(err.message);
-    } finally {
       setIsRestoringSession(false);
-    }
-  };
+    };
+    
+    restoreSession();
+  }, []);
 
   // Update Refs when state changes
   useEffect(() => {
@@ -710,7 +647,7 @@ export default function App() {
 
   const handleLogout = async () => {
     if (currentUser && supabase) await supabase.from('users').update({ is_online: false }).eq('id', currentUser.id);
-    await supabase.auth.signOut();
+    localStorage.removeItem('atpukur_user_id');
     setCurrentUser(null);
     setActiveUser(null);
     setUsers([]); // Clear users to prevent stale data crash
@@ -733,6 +670,19 @@ export default function App() {
     };
     const { error } = await supabase.from('messages').insert(payload);
     if (error) { console.error(error); alert("Failed to send message."); } else { setInputText(''); }
+  };
+
+  // --- Avatar Helper ---
+  const getAvatarEmoji = (username: string) => {
+    if (!username) return '👤';
+    if (username === 'PUBLIC_NET') return '🌐';
+    if (username.toLowerCase() === 'habib') return '👑';
+    const emojis = ['👾', '🤖', '👽', '💀', '👻', '👺', '🤡', '☠️', '💻', '💾', '💿', '📼', '🕹️', '🔮', '🧬', '🦠', '🔋', '📡', '🔭', '🧱'];
+    let hash = 0;
+    for (let i = 0; i < username.length; i++) {
+        hash = username.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return emojis[Math.abs(hash) % emojis.length];
   };
 
   // --- Helpers for Display ---
@@ -837,60 +787,35 @@ export default function App() {
                 </div>
               )}
 
-              <div className="space-y-6">
-                <button 
-                  onClick={async () => {
-                    setLoginError(null);
-                    try {
-                      const result = await signInWithPopup(auth, googleProvider);
-                      // handleFirebaseUser is called by onAuthStateChanged listener
-                    } catch (err: any) {
-                      console.error("Login Error:", err);
-                      if (err.code === 'auth/unauthorized-domain') {
-                        setLoginError(`DOMAIN NOT AUTHORIZED: Go to Firebase Console > Authentication > Settings > Authorized Domains and add: ${window.location.hostname}`);
-                      } else {
-                        setLoginError(err.message || "UPLINK FAILED");
-                      }
-                    }
-                  }}
-                  className="w-full bg-white text-black py-4 rounded-lg font-mono font-bold tracking-widest uppercase hover:bg-gray-200 transition-all duration-300 shadow-[0_0_20px_rgba(255,255,255,0.2)] relative overflow-hidden group/btn flex items-center justify-center gap-3"
-                >
-                  <svg className="w-5 h-5" viewBox="0 0 24 24">
-                    <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
-                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-                  </svg>
-                  <span className="relative z-10">
-                    Authenticate via Google (Firebase)
-                  </span>
-                </button>
-                <p className="text-[10px] text-center text-gray-500 font-mono">
-                  * Uses Firebase Auth linked to Supabase DB
-                </p>
-                
-                <div className="pt-4 border-t border-white/10">
-                  <button
-                    onClick={() => {
-                      const devUser: User = {
-                        id: 'dev-user-' + Math.random().toString(36).substr(2, 9),
-                        username: 'DEV_OPERATOR',
-                        role: 'admin',
-                        can_send: true,
-                        is_online: true,
-                        last_seen: new Date().toISOString(),
-                        created_at: new Date().toISOString()
-                      };
-                      setCurrentUser(devUser);
-                      localStorage.setItem('atpukur_user_id', devUser.id);
-                    }}
-                    className="w-full py-2 text-[10px] text-gray-600 hover:text-white font-mono uppercase tracking-widest transition-colors flex items-center justify-center gap-2 group"
-                  >
-                    <Terminal className="w-3 h-3 group-hover:text-neon-green" />
-                    <span>Bypass Auth (Dev Mode)</span>
-                  </button>
+              <form onSubmit={handleLogin} className="space-y-6">
+                <div className="space-y-2">
+                  <label className="text-[10px] uppercase tracking-widest text-gray-500 ml-1">Identify Yourself</label>
+                  <div className="relative group/input">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-neon-green font-mono text-sm pointer-events-none">{">_"}</span>
+                    <input 
+                      autoFocus
+                      type="text"
+                      placeholder="ENTER_ALIAS" 
+                      value={loginUsername}
+                      onChange={(e) => setLoginUsername(e.target.value)}
+                      className="w-full bg-black/50 border border-white/20 rounded-lg py-4 pl-10 pr-4 text-white font-mono text-sm focus:outline-none focus:border-neon-green focus:shadow-[0_0_20px_rgba(0,255,65,0.2)] transition-all placeholder-gray-700"
+                    />
+                    <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                       <Cpu className="w-4 h-4 text-gray-600 group-focus-within/input:text-neon-green transition-colors" />
+                    </div>
+                  </div>
                 </div>
-              </div>
+
+                <button 
+                  type="submit" 
+                  className="w-full bg-neon-green/10 border border-neon-green/50 text-neon-green py-4 rounded-lg font-mono font-bold tracking-widest uppercase hover:bg-neon-green hover:text-black transition-all duration-300 hover:shadow-[0_0_30px_rgba(0,255,65,0.4)] relative overflow-hidden group/btn"
+                >
+                  <span className="relative z-10 flex items-center justify-center gap-2">
+                    Initialize Connection <ChevronLeft className="w-4 h-4 rotate-180" />
+                  </span>
+                  <div className="absolute inset-0 bg-neon-green/20 -translate-x-full group-hover/btn:translate-x-0 transition-transform duration-300"></div>
+                </button>
+              </form>
 
               <div className="mt-6 text-center">
                  <p className="text-[10px] text-gray-600 font-mono">
@@ -918,13 +843,6 @@ export default function App() {
       </div>
 
       {showAdmin && <AdminDashboard onClose={() => setShowAdmin(false)} />}
-      {showProfile && currentUser && (
-        <UserProfileDashboard 
-          user={currentUser} 
-          onClose={() => setShowProfile(false)} 
-          onUpdate={(updated) => setCurrentUser(updated)} 
-        />
-      )}
 
       {/* CALL OVERLAY UI */}
       {callStatus !== 'idle' && (
@@ -937,11 +855,7 @@ export default function App() {
                <div className="absolute inset-0 overflow-hidden z-0 opacity-30">
                   <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black/80 z-10"></div>
                   <div className="w-full h-full flex items-center justify-center blur-[100px] scale-150">
-                     <UserAvatar 
-                        user={incomingCallUser || activeUser || { username: "" }} 
-                        className="w-full h-full bg-transparent border-none shadow-none" 
-                        emojiClassName="text-[150px]"
-                     />
+                     <div className="text-[150px]">{getAvatarEmoji((incomingCallUser?.username || activeUser?.username || ""))}</div>
                   </div>
                </div>
                {/* Noise/Cyber Overlay */}
@@ -981,11 +895,9 @@ export default function App() {
                     <div className={`absolute inset-0 rounded-full animate-ping opacity-20 ${callStatus === 'incoming' ? 'bg-neon-purple' : 'bg-neon-green'}`}></div>
                     <div className={`absolute inset-0 rounded-full animate-pulse opacity-20 blur-xl ${callStatus === 'incoming' ? 'bg-neon-purple' : 'bg-neon-green'}`}></div>
                     
-                    <UserAvatar 
-                      user={incomingCallUser || activeUser || { username: "" }} 
-                      className="w-40 h-40 rounded-full text-7xl z-10" 
-                      emojiClassName="text-7xl"
-                    />
+                    <div className="w-40 h-40 rounded-full bg-[#151515] border border-white/10 flex items-center justify-center text-7xl shadow-2xl relative z-10">
+                       {getAvatarEmoji((incomingCallUser?.username || activeUser?.username || ""))}
+                    </div>
                  </div>
               </div>
            )}
@@ -1053,31 +965,19 @@ export default function App() {
       `}>
         {/* User Profile Header */}
         <div className="p-4 border-b border-white/10 flex justify-between items-center bg-white/5">
-          <button 
-            onClick={() => setShowProfile(true)}
-            className="flex items-center gap-3 hover:bg-white/5 p-2 -ml-2 rounded-lg transition-colors text-left group"
-          >
-            <div className="w-10 h-10 rounded-sm bg-gradient-to-br from-gray-900 to-black border border-white/20 flex items-center justify-center shadow-lg text-lg overflow-hidden relative">
-               {currentUser.avatar_url ? (
-                 <img src={currentUser.avatar_url} alt={currentUser.username} className="w-full h-full object-cover" />
-               ) : (
-                 getAvatarEmoji(currentUser.username)
-               )}
-               <div className="absolute inset-0 bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                 <UserIcon className="w-4 h-4 text-white" />
-               </div>
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-sm bg-gradient-to-br from-gray-900 to-black border border-white/20 flex items-center justify-center shadow-lg text-lg">
+               {getAvatarEmoji(currentUser.username)}
             </div>
             <div>
-              <div className="font-mono font-bold text-white text-sm group-hover:text-neon-green transition-colors">
-                {currentUser.full_name || currentUser.username}
-              </div>
+              <div className="font-mono font-bold text-white text-sm">{currentUser.username}</div>
               <div className="flex items-center gap-1.5 mt-1">
                 <span className="w-1.5 h-1.5 bg-neon-green rounded-full shadow-[0_0_5px_#00ff41] animate-pulse"></span>
                 <span className="text-[9px] text-neon-green uppercase tracking-wider">Online</span>
               </div>
             </div>
-          </button>
-          <button onClick={handleLogout} className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors" title="Disconnect Uplink">
+          </div>
+          <button onClick={handleLogout} className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors">
             <LogOut className="w-5 h-5" />
           </button>
         </div>
@@ -1137,7 +1037,9 @@ export default function App() {
             >
               <div className="flex items-center gap-3 relative z-10">
                 <div className="relative">
-                  <UserAvatar user={user} className="w-10 h-10" />
+                  <div className="w-10 h-10 rounded-sm bg-black/60 border border-white/10 flex items-center justify-center text-lg shadow-inner">
+                     {getAvatarEmoji(user.username)}
+                  </div>
                   <div className={`absolute -bottom-1 -right-1 w-2.5 h-2.5 rounded-full border-2 border-black ${getIsUserOnline(user.id) ? 'bg-neon-green shadow-[0_0_5px_rgba(0,255,65,0.8)]' : 'bg-gray-600'}`} />
                 </div>
                 
@@ -1208,13 +1110,9 @@ export default function App() {
                   <ChevronLeft className="w-6 h-6" />
                 </button>
                 <div className="flex items-center gap-3">
-                    {activeUser.id === GROUP_CHAT_ID ? (
-                       <div className="w-9 h-9 rounded-sm flex items-center justify-center shadow-lg text-lg bg-neon-purple/20 text-neon-purple">
-                           {getAvatarEmoji(activeUser.username)}
-                       </div>
-                    ) : (
-                       <UserAvatar user={activeUser} className="w-9 h-9" />
-                    )}
+                  <div className={`w-9 h-9 rounded-sm flex items-center justify-center shadow-lg text-lg ${activeUser.id === GROUP_CHAT_ID ? 'bg-neon-purple/20 text-neon-purple' : 'bg-white/10 text-white'}`}>
+                      {getAvatarEmoji(activeUser.username)}
+                  </div>
                   <div>
                     <div className="font-mono font-bold text-white flex items-center gap-2 text-sm md:text-base">
                       {activeUser.username}
@@ -1269,10 +1167,9 @@ export default function App() {
                         
                         {/* Avatar for others */}
                         {!isMe && (
-                          <UserAvatar 
-                            user={users.find(u => u.id === msg.sender_id) || { username: msg.username }} 
-                            className="w-8 h-8 text-sm" 
-                          />
+                          <div className="w-8 h-8 rounded-sm bg-black/60 border border-white/10 flex-shrink-0 flex items-center justify-center text-sm shadow-lg">
+                             {getAvatarEmoji(msg.username)}
+                          </div>
                         )}
 
                         <div className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>

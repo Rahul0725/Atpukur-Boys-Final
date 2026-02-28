@@ -81,27 +81,3 @@ export const Badge: React.FC<{ status: 'online' | 'offline' | 'admin' }> = ({ st
     </div>
   );
 };
-
-export const getAvatarEmoji = (username: string) => {
-  if (!username) return '👤';
-  if (username === 'PUBLIC_NET') return '🌐';
-  if (username.toLowerCase() === 'habib') return '👑';
-  const emojis = ['👾', '🤖', '👽', '💀', '👻', '👺', '🤡', '☠️', '💻', '💾', '💿', '📼', '🕹️', '🔮', '🧬', '🦠', '🔋', '📡', '🔭', '🧱'];
-  let hash = 0;
-  for (let i = 0; i < username.length; i++) {
-      hash = username.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return emojis[Math.abs(hash) % emojis.length];
-};
-
-export const UserAvatar: React.FC<{ user: { username: string; avatar_url?: string }; className?: string; emojiClassName?: string }> = ({ user, className = "w-10 h-10", emojiClassName = "text-lg" }) => {
-  return (
-    <div className={`rounded-sm bg-gradient-to-br from-gray-900 to-black border border-white/20 flex items-center justify-center shadow-lg overflow-hidden relative shrink-0 ${className}`}>
-      {user.avatar_url ? (
-        <img src={user.avatar_url} alt={user.username} className="w-full h-full object-cover" />
-      ) : (
-        <span className={emojiClassName}>{getAvatarEmoji(user.username)}</span>
-      )}
-    </div>
-  );
-};

@@ -1,8 +1,6 @@
 export interface User {
   id: string;
   username: string;
-  full_name?: string;
-  avatar_url?: string;
   role: 'admin' | 'user';
   can_send: boolean;
   is_online: boolean;
